@@ -31,3 +31,23 @@ harness = false
 [[bench]]
 name = "tpch"
 harness = false
+
+[[bench]]
+name = "tpcds"
+harness = false
+
+[[bench]]
+name = "scaling"
+harness = false
+
+[[bench]]
+name = "string_workload"
+harness = false
+
+[[bench]]
+name = "concurrent"
+harness = false
+
+[[bench]]
+name = "substrait_roundtrip"
+harness = false

@@ -2826,10 +2826,12 @@ dependencies = [
  "arrow-flight",
  "arrow-ipc 55.2.0",
  "arrow-schema 55.2.0",
+ "criterion",
  "futures",
  "prism-executor",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
 ]
