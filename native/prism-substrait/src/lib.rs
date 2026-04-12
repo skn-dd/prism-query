@@ -7,7 +7,9 @@
 
 pub mod consumer;
 pub mod error;
+pub mod executor;
 pub mod plan;
 
 pub use error::{SubstraitError, Result};
 pub use plan::{ExecutionPlan, PlanNode};
+pub use executor::execute_plan;

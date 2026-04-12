@@ -28,6 +28,9 @@ pub enum SubstraitError {
     #[error("Executor error: {0}")]
     Executor(#[from] prism_executor::PrismError),
 
+    #[error("Arrow error: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }

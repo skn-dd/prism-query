@@ -1,5 +1,10 @@
 //! Shuffle writer — partitions output RecordBatches by hash and serves
 //! them via Arrow Flight for remote workers to pull.
+//!
+//! Flight methods:
+//! - `do_get`:    Serve RecordBatches from PartitionStore by key (ticket)
+//! - `do_put`:    Receive RecordBatches from coordinator, store by descriptor path
+//! - `do_action`: Execute commands (query execution, status checks)
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -9,6 +14,7 @@ use std::sync::Arc;
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type, Float64Type};
+use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
@@ -17,10 +23,22 @@ use arrow_flight::{
 };
 use arrow_schema::DataType;
 use futures::stream::{self, BoxStream, StreamExt};
+use futures::TryStreamExt;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::PartitionId;
+
+/// Trait for handling `do_action` "execute" commands.
+/// Workers implement this to execute query plans against local data.
+#[tonic::async_trait]
+pub trait ActionHandler: Send + Sync + 'static {
+    async fn execute(
+        &self,
+        command: serde_json::Value,
+        store: &PartitionStore,
+    ) -> anyhow::Result<RecordBatch>;
+}
 
 /// In-memory partition store.
 #[derive(Default)]
@@ -101,13 +119,26 @@ fn hash_value(array: &dyn Array, row: usize, hasher: &mut impl Hasher) {
     }
 }
 
-/// Flight service serving partition data.
+/// Flight service serving partition data, receiving data via DoPut,
+/// and executing query plans via DoAction.
 pub struct ShuffleFlightService {
     store: Arc<PartitionStore>,
+    action_handler: Arc<RwLock<Option<Box<dyn ActionHandler>>>>,
 }
 
 impl ShuffleFlightService {
-    pub fn new(store: Arc<PartitionStore>) -> Self { Self { store } }
+    pub fn new(store: Arc<PartitionStore>) -> Self {
+        Self {
+            store,
+            action_handler: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Register an action handler for executing query plans.
+    pub async fn set_action_handler(&self, handler: Box<dyn ActionHandler>) {
+        *self.action_handler.write().await = Some(handler);
+    }
+
     pub fn into_server(self) -> FlightServiceServer<Self> { FlightServiceServer::new(self) }
 }
 
@@ -153,14 +184,101 @@ impl FlightService for ShuffleFlightService {
         Ok(Response::new(Box::pin(flight_stream)))
     }
 
-    async fn do_put(&self, _req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented("do_put"))
+    async fn do_put(&self, request: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
+        let mut stream = request.into_inner();
+
+        // First message should contain the FlightDescriptor with the storage key
+        let first = stream.message().await?
+            .ok_or_else(|| Status::invalid_argument("empty do_put stream"))?;
+
+        let descriptor = first.flight_descriptor
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("first FlightData must have descriptor"))?;
+        let key = String::from_utf8(descriptor.cmd.to_vec())
+            .or_else(|_| {
+                // Fall back to path
+                Ok::<String, Status>(descriptor.path.join("/"))
+            })
+            .map_err(|e: Status| e)?;
+
+        if key.is_empty() {
+            return Err(Status::invalid_argument("descriptor must have cmd or path for storage key"));
+        }
+
+        // Decode all FlightData into RecordBatches
+        let flight_stream = FlightRecordBatchStream::new_from_flight_data(
+            futures::stream::once(async { Ok(first) })
+                .chain(stream.map(|r| r.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e)))))
+        );
+        let batches: Vec<RecordBatch> = flight_stream
+            .try_collect()
+            .await
+            .map_err(|e| Status::internal(format!("failed to decode batches: {}", e)))?;
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        for batch in batches {
+            self.store.put(&key, batch).await;
+        }
+
+        tracing::info!("do_put: stored {} rows under key '{}'", total_rows, key);
+
+        let result = PutResult { app_metadata: format!("stored {} rows", total_rows).into() };
+        let output = futures::stream::once(async { Ok(result) });
+        Ok(Response::new(Box::pin(output)))
     }
-    async fn do_action(&self, _req: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
-        Err(Status::unimplemented("do_action"))
+
+    async fn do_action(&self, request: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
+        let action = request.into_inner();
+        let action_type = action.r#type.as_str();
+
+        match action_type {
+            "ping" => {
+                let result = arrow_flight::Result { body: "pong".into() };
+                Ok(Response::new(Box::pin(futures::stream::once(async { Ok(result) }))))
+            }
+            "list_keys" => {
+                let map = self.store.partitions.read().await;
+                let keys: Vec<String> = map.keys().cloned().collect();
+                let body = serde_json::to_vec(&keys)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let result = arrow_flight::Result { body: body.into() };
+                Ok(Response::new(Box::pin(futures::stream::once(async { Ok(result) }))))
+            }
+            "execute" => {
+                // Body is JSON: { "substrait_plan_b64": "...", "tables": {"name": "key"}, "result_key": "..." }
+                let cmd: serde_json::Value = serde_json::from_slice(&action.body)
+                    .map_err(|e| Status::invalid_argument(format!("invalid JSON: {}", e)))?;
+
+                let result_key = cmd["result_key"].as_str()
+                    .ok_or_else(|| Status::invalid_argument("missing result_key"))?
+                    .to_string();
+
+                // Dispatch to the action handler (set externally)
+                if let Some(handler) = &*self.action_handler.read().await {
+                    let result_batch = handler.execute(cmd, &self.store).await
+                        .map_err(|e| Status::internal(format!("execution failed: {}", e)))?;
+
+                    self.store.put(&result_key, result_batch).await;
+
+                    let result = arrow_flight::Result {
+                        body: format!("{{\"status\":\"ok\",\"result_key\":\"{}\"}}", result_key).into(),
+                    };
+                    Ok(Response::new(Box::pin(futures::stream::once(async { Ok(result) }))))
+                } else {
+                    Err(Status::unimplemented("no action handler registered"))
+                }
+            }
+            _ => Err(Status::unimplemented(format!("unknown action type: {}", action_type))),
+        }
     }
+
     async fn list_actions(&self, _req: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
-        Err(Status::unimplemented("list_actions"))
+        let actions = vec![
+            Ok(ActionType { r#type: "ping".into(), description: "Health check".into() }),
+            Ok(ActionType { r#type: "list_keys".into(), description: "List stored partition keys".into() }),
+            Ok(ActionType { r#type: "execute".into(), description: "Execute a query plan".into() }),
+        ];
+        Ok(Response::new(Box::pin(futures::stream::iter(actions))))
     }
     async fn do_exchange(&self, _req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> {
         Err(Status::unimplemented("do_exchange"))

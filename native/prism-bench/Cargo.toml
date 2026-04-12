@@ -1,31 +1,29 @@
 [package]
-name = "prism-flight"
-description = "Arrow Flight shuffle writer/reader for Prism inter-worker communication"
+name = "prism-bench"
+description = "Distributed benchmark — Rust Flight workers for Prism"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "prism-worker"
+path = "src/main.rs"
+
 [dependencies]
+prism-executor = { path = "../prism-executor" }
+prism-flight = { path = "../prism-flight" }
+prism-substrait = { path = "../prism-substrait" }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
-prism-executor = { path = "../prism-executor" }
 tonic = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
-
-[dev-dependencies]
-arrow = { workspace = true }
-tokio = { workspace = true }
-tokio-stream = "0.1"
-criterion = { workspace = true }
-
-[[bench]]
-name = "shuffle"
-harness = false
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }

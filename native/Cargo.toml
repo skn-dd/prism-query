@@ -5,6 +5,7 @@ members = [
     "prism-substrait",
     "prism-osi",
     "prism-jni",
+    "prism-bench",
 ]
 resolver = "2"
 
