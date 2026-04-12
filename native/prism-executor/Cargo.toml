@@ -27,3 +27,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "operators"
 harness = false
+
+[[bench]]
+name = "tpch"
+harness = false
