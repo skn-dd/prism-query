@@ -1,0 +1,23 @@
+[package]
+name = "prism-jni"
+description = "JNI bridge exposing Prism native executor to Trino's Java runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+prism-executor = { path = "../prism-executor" }
+prism-substrait = { path = "../prism-substrait" }
+prism-flight = { path = "../prism-flight" }
+prism-osi = { path = "../prism-osi" }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
+jni = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

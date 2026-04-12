@@ -1,0 +1,23 @@
+[package]
+name = "prism-flight"
+description = "Arrow Flight shuffle writer/reader for Prism inter-worker communication"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
+prism-executor = { path = "../prism-executor" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

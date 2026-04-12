@@ -1,0 +1,29 @@
+[package]
+name = "prism-executor"
+description = "Arrow-native SIMD execution operators for Prism"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-data = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+arrow-string = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-physical-expr = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "operators"
+harness = false

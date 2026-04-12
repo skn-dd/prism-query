@@ -1,0 +1,32 @@
+# Prism Coordinator — Standard Trino coordinator with Substrait serializer
+# The coordinator doesn't need native libs (it only plans, doesn't execute)
+
+FROM maven:3.9-eclipse-temurin-21 AS java-builder
+
+WORKDIR /build
+COPY trino/ trino/
+
+WORKDIR /build/trino/prism-bridge
+RUN mvn package -DskipTests
+
+FROM eclipse-temurin:21-jre-jammy
+
+RUN groupadd -r prism && useradd -r -g prism prism
+
+WORKDIR /opt/prism
+
+# Copy prism-bridge jar (coordinator uses SubstraitSerializer only)
+COPY --from=java-builder /build/trino/prism-bridge/target/prism-bridge-*.jar \
+    /opt/prism/plugin/prism-bridge/
+
+# Default coordinator config
+COPY docker/etc/config-coordinator.properties /opt/prism/etc/config.properties
+COPY docker/etc/jvm.config /opt/prism/etc/jvm.config
+COPY docker/etc/node.properties /opt/prism/etc/node.properties
+COPY docker/etc/ranger-access-control.properties /opt/prism/etc/access-control.properties
+
+USER prism
+
+EXPOSE 8080
+
+ENTRYPOINT ["/opt/prism/trino/bin/launcher", "run"]

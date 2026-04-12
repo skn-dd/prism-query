@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package prism.execution;
+
+option java_package = "io.prism.proto";
+option java_outer_classname = "ExecutionProto";
+
+// Task assignment from coordinator to worker.
+message TaskAssignment {
+  string query_id = 1;
+  string stage_id = 2;
+  int32 partition_id = 3;
+
+  // Substrait plan for this task (serialized protobuf).
+  bytes substrait_plan = 4;
+
+  // Data sources: catalog.schema.table -> split info.
+  repeated DataSplit splits = 5;
+
+  // Arrow Flight endpoints for shuffle inputs.
+  repeated ShuffleInput shuffle_inputs = 6;
+
+  // Arrow Flight endpoint where this task writes its output.
+  string output_endpoint = 7;
+  int32 output_partition_count = 8;
+}
+
+// A split of data to be read by the task.
+message DataSplit {
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
+  // Opaque split handle (connector-specific).
+  bytes split_handle = 4;
+}
+
+// Reference to a remote shuffle partition.
+message ShuffleInput {
+  string stage_id = 1;
+  int32 partition_id = 2;
+  string flight_endpoint = 3;
+}
+
+// Task status reported from worker to coordinator.
+message TaskStatus {
+  string query_id = 1;
+  string stage_id = 2;
+  int32 partition_id = 3;
+
+  enum State {
+    PENDING = 0;
+    RUNNING = 1;
+    COMPLETED = 2;
+    FAILED = 3;
+    CANCELLED = 4;
+  }
+  State state = 4;
+
+  // Execution metrics.
+  TaskMetrics metrics = 5;
+
+  // Error message if state == FAILED.
+  string error_message = 6;
+}
+
+// Execution metrics for a single task.
+message TaskMetrics {
+  // Wall clock time in milliseconds.
+  int64 wall_time_ms = 1;
+  // CPU time in milliseconds.
+  int64 cpu_time_ms = 2;
+  // Input rows processed.
+  int64 input_rows = 3;
+  // Output rows produced.
+  int64 output_rows = 4;
+  // Peak memory usage in bytes.
+  int64 peak_memory_bytes = 5;
+  // Arrow Flight bytes transferred (shuffle output).
+  int64 shuffle_bytes_written = 6;
+  // Arrow Flight bytes received (shuffle input).
+  int64 shuffle_bytes_read = 7;
+
+  // Per-operator breakdown.
+  repeated OperatorMetric operator_metrics = 8;
+}
+
+// Metrics for a single operator in the plan.
+message OperatorMetric {
+  string operator_type = 1;
+  int64 wall_time_ms = 2;
+  int64 input_rows = 3;
+  int64 output_rows = 4;
+  int64 peak_memory_bytes = 5;
+}
+
+// Worker registration with the coordinator.
+message WorkerRegistration {
+  string worker_id = 1;
+  string host = 2;
+  int32 flight_port = 3;
+  int32 available_cores = 4;
+  int64 available_memory_bytes = 5;
+}
+
+// Coordinator → Worker: cancel a running task.
+message CancelTask {
+  string query_id = 1;
+  string stage_id = 2;
+  int32 partition_id = 3;
+}

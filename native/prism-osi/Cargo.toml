@@ -1,0 +1,17 @@
+[package]
+name = "prism-osi"
+description = "Open Semantic Interchange (OSI) model parser and Substrait compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prism-substrait = { path = "../prism-substrait" }
+substrait = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

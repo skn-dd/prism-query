@@ -1,0 +1,58 @@
+# Prism Worker — Hybrid Java + Native container
+# Multi-stage build: Rust native libs → Java Trino worker
+
+# Stage 1: Build Rust native libraries
+FROM rust:1.82-bookworm AS rust-builder
+
+WORKDIR /build
+COPY native/ native/
+WORKDIR /build/native
+
+RUN cargo build --release --workspace
+
+# Stage 2: Build Java Trino + prism-bridge
+FROM maven:3.9-eclipse-temurin-21 AS java-builder
+
+WORKDIR /build
+COPY trino/ trino/
+
+WORKDIR /build/trino/prism-bridge
+RUN mvn package -DskipTests
+
+# Stage 3: Runtime image
+FROM eclipse-temurin:21-jre-jammy
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create prism user
+RUN groupadd -r prism && useradd -r -g prism prism
+
+WORKDIR /opt/prism
+
+# Copy Trino distribution (mount or download in CI)
+# COPY --from=trino-dist /opt/trino /opt/prism/trino
+
+# Copy prism-bridge jar
+COPY --from=java-builder /build/trino/prism-bridge/target/prism-bridge-*.jar \
+    /opt/prism/plugin/prism-bridge/
+
+# Copy native libraries
+COPY --from=rust-builder /build/native/target/release/libprism_jni.so \
+    /opt/prism/lib/native/
+
+# Default worker config
+COPY docker/etc/config-worker.properties /opt/prism/etc/config.properties
+COPY docker/etc/jvm.config /opt/prism/etc/jvm.config
+COPY docker/etc/node.properties /opt/prism/etc/node.properties
+COPY docker/etc/ranger-access-control.properties /opt/prism/etc/access-control.properties
+
+ENV JAVA_LIBRARY_PATH=/opt/prism/lib/native
+ENV PRISM_NATIVE_LIB_PATH=/opt/prism/lib/native/libprism_jni.so
+
+USER prism
+
+EXPOSE 8080 50051
+
+ENTRYPOINT ["/opt/prism/trino/bin/launcher", "run"]

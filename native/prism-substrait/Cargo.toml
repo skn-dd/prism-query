@@ -1,0 +1,21 @@
+[package]
+name = "prism-substrait"
+description = "Substrait plan consumer — deserializes Substrait IR into Prism execution plans"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+prism-executor = { path = "../prism-executor" }
+substrait = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

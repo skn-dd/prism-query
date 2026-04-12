@@ -1,0 +1,134 @@
+name: ecommerce
+description: E-commerce analytics semantic model
+version: "0.1.1"
+
+datasets:
+  - name: orders
+    description: Customer order transactions
+    source:
+      catalog: hive
+      schema: analytics
+      table: orders
+    fields:
+      - name: order_id
+        type: integer
+        description: Unique order identifier
+        primary_key: true
+      - name: customer_id
+        type: integer
+        description: Foreign key to customers
+      - name: order_date
+        type: date
+        description: Date the order was placed
+      - name: amount
+        type: decimal
+        description: Order total in USD
+      - name: status
+        type: varchar
+        description: Order status (pending, shipped, delivered, returned)
+      - name: region
+        type: varchar
+        description: Geographic region
+        tags: [geography, dimension]
+    metrics:
+      - name: total_revenue
+        expression: "SUM(amount)"
+        aggregate: sum
+        field: amount
+        description: Total revenue across all orders
+      - name: order_count
+        expression: "COUNT(order_id)"
+        aggregate: count
+        field: order_id
+        description: Number of orders
+      - name: avg_order_value
+        expression: "AVG(amount)"
+        aggregate: avg
+        field: amount
+        description: Average order value
+      - name: delivered_revenue
+        expression: "SUM(amount)"
+        aggregate: sum
+        field: amount
+        description: Revenue from delivered orders only
+        filters:
+          - field: status
+            operator: "="
+            value: "'delivered'"
+
+  - name: customers
+    description: Customer profiles
+    source:
+      catalog: hive
+      schema: analytics
+      table: customers
+    fields:
+      - name: customer_id
+        type: integer
+        description: Unique customer identifier
+        primary_key: true
+      - name: name
+        type: varchar
+        description: Customer full name
+      - name: email
+        type: varchar
+        description: Customer email address
+      - name: signup_date
+        type: date
+        description: Account creation date
+      - name: tier
+        type: varchar
+        description: Customer tier (bronze, silver, gold, platinum)
+        tags: [dimension]
+    metrics:
+      - name: customer_count
+        expression: "COUNT(DISTINCT customer_id)"
+        aggregate: count_distinct
+        field: customer_id
+        description: Total unique customers
+
+  - name: products
+    description: Product catalog
+    source:
+      catalog: hive
+      schema: analytics
+      table: products
+    fields:
+      - name: product_id
+        type: integer
+        description: Unique product identifier
+        primary_key: true
+      - name: name
+        type: varchar
+        description: Product name
+      - name: category
+        type: varchar
+        description: Product category
+        tags: [dimension]
+      - name: price
+        type: decimal
+        description: Current price in USD
+      - name: cost
+        type: decimal
+        description: Unit cost in USD
+    metrics:
+      - name: avg_price
+        expression: "AVG(price)"
+        aggregate: avg
+        field: price
+        description: Average product price
+      - name: avg_margin
+        expression: "AVG(price - cost)"
+        aggregate: avg
+        field: price
+        description: Average profit margin
+
+relationships:
+  - name: order_customer
+    from:
+      dataset: orders
+      field: customer_id
+    to:
+      dataset: customers
+      field: customer_id
+    relationship_type: many_to_one
