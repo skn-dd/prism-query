@@ -1,13 +1,13 @@
 {
-  "trino_scan": 327.34,
-  "trino_filter": 349.85,
-  "trino_agg": 389.18,
-  "trino_q1": 449.9,
-  "trino_q6": 298.39,
-  "prism_scan": 183.59,
-  "prism_filter": 189.43,
-  "prism_agg": 237.72,
-  "prism_q1": 383.51,
-  "prism_q6": 175.79,
-  "prism_project": 179.04
+  "trino_scan": 305.86,
+  "trino_filter": 318.88,
+  "trino_agg": 401.03,
+  "trino_q1": 483.63,
+  "trino_q6": 306.69,
+  "prism_scan": 180.74,
+  "prism_filter": 179.83,
+  "prism_agg": 218.86,
+  "prism_q1": 386.8,
+  "prism_q6": 173.23,
+  "prism_project": 172.16
 }
