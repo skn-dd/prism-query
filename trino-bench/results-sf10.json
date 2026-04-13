@@ -1,0 +1,74 @@
+{
+  "trino_scan": {
+    "ms": 2130.0,
+    "rows": 1
+  },
+  "trino_filter": {
+    "ms": 2130.0,
+    "rows": 1
+  },
+  "trino_agg": {
+    "ms": 2930.0,
+    "rows": 3
+  },
+  "trino_q1": {
+    "ms": 3810.0,
+    "rows": 4
+  },
+  "trino_q6": {
+    "ms": 2029.9999999999998,
+    "rows": 1
+  },
+  "trino_q3": {
+    "ms": 6570.0,
+    "rows": 10
+  },
+  "trino_orders_agg": {
+    "ms": 1070.0,
+    "rows": 3
+  },
+  "trino_multi_agg": {
+    "ms": 3650.0,
+    "rows": 4
+  },
+  "trino_topn": {
+    "ms": 2550.0,
+    "rows": 10
+  },
+  "prism_scan": {
+    "ms": 825.01,
+    "rows": 1
+  },
+  "prism_filter": {
+    "ms": 465.41,
+    "rows": 1
+  },
+  "prism_agg": {
+    "ms": 1480.0,
+    "rows": 3
+  },
+  "prism_q1": {
+    "ms": 3050.0,
+    "rows": 6
+  },
+  "prism_q6": {
+    "ms": 412.57,
+    "rows": 1
+  },
+  "prism_join": {
+    "ms": 2360.0,
+    "rows": 3
+  },
+  "prism_orders_agg": {
+    "ms": 418.88,
+    "rows": 3
+  },
+  "prism_multi_agg": {
+    "ms": 2630.0,
+    "rows": 6
+  },
+  "prism_topn": {
+    "ms": 1670.0,
+    "rows": 10
+  }
+}
