@@ -3,13 +3,16 @@
 //! Replaces Trino's `ScanFilterAndProjectOperator`. Evaluates predicates
 //! using Arrow compute kernels with SIMD bitmasking, then projects selected columns.
 
+use std::sync::Arc;
+
 use arrow::compute::{self, FilterBuilder};
 use arrow_array::{
-    cast::AsArray, Array, BooleanArray, Datum, RecordBatch,
+    cast::AsArray, Array, ArrayRef, BooleanArray, Datum, Float64Array, RecordBatch,
 };
 use arrow_array::types::{Float64Type, Int32Type, Int64Type};
+use arrow_cast::cast;
 use arrow_ord::cmp;
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::{PrismError, Result};
 
@@ -130,6 +133,107 @@ pub fn filter_and_project(
     } else {
         project_batch(&filtered, column_indices)
     }
+}
+
+// ===== Scalar Expression Evaluation =====
+
+/// Arithmetic operation for scalar expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithmeticOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+/// A scalar expression that produces an Arrow array from a RecordBatch.
+#[derive(Debug, Clone)]
+pub enum ScalarExpr {
+    /// Reference to an input column by index.
+    ColumnRef(usize),
+    /// A literal value broadcast to the batch length.
+    Literal(ScalarValue),
+    /// Binary arithmetic operation.
+    BinaryOp {
+        op: ArithmeticOp,
+        left: Box<ScalarExpr>,
+        right: Box<ScalarExpr>,
+    },
+    /// Unary negation.
+    Negate(Box<ScalarExpr>),
+}
+
+/// Evaluate a scalar expression against a RecordBatch, returning a Float64 array.
+pub fn evaluate_scalar_expr(batch: &RecordBatch, expr: &ScalarExpr) -> Result<ArrayRef> {
+    match expr {
+        ScalarExpr::ColumnRef(idx) => Ok(batch.column(*idx).clone()),
+        ScalarExpr::Literal(val) => {
+            let len = batch.num_rows();
+            let arr: ArrayRef = match val {
+                ScalarValue::Float64(v) => Arc::new(Float64Array::from(vec![*v; len])),
+                ScalarValue::Int64(v) => Arc::new(arrow_array::Int64Array::from(vec![*v; len])),
+                ScalarValue::Int32(v) => Arc::new(arrow_array::Int32Array::from(vec![*v; len])),
+                _ => return Err(PrismError::InvalidArgument(
+                    format!("unsupported literal type in scalar expr: {:?}", val),
+                )),
+            };
+            Ok(arr)
+        }
+        ScalarExpr::BinaryOp { op, left, right } => {
+            let l = evaluate_scalar_expr(batch, left)?;
+            let r = evaluate_scalar_expr(batch, right)?;
+            // Cast both operands to Float64 for arithmetic
+            let l_f64 = cast(&l, &DataType::Float64)?;
+            let r_f64 = cast(&r, &DataType::Float64)?;
+            let la = l_f64.as_primitive::<Float64Type>();
+            let ra = r_f64.as_primitive::<Float64Type>();
+            let result: ArrayRef = match op {
+                ArithmeticOp::Add => Arc::new(arrow::compute::kernels::numeric::add(la, ra)?),
+                ArithmeticOp::Subtract => Arc::new(arrow::compute::kernels::numeric::sub(la, ra)?),
+                ArithmeticOp::Multiply => Arc::new(arrow::compute::kernels::numeric::mul(la, ra)?),
+                ArithmeticOp::Divide => Arc::new(arrow::compute::kernels::numeric::div(la, ra)?),
+            };
+            Ok(result)
+        }
+        ScalarExpr::Negate(inner) => {
+            let arr = evaluate_scalar_expr(batch, inner)?;
+            let f64_arr = cast(&arr, &DataType::Float64)?;
+            let fa = f64_arr.as_primitive::<Float64Type>();
+            let negated: Float64Array = fa.iter().map(|v| v.map(|x| -x)).collect();
+            Ok(Arc::new(negated))
+        }
+    }
+}
+
+/// Project columns by index plus evaluate computed expressions, producing a new RecordBatch.
+pub fn project_batch_with_exprs(
+    batch: &RecordBatch,
+    column_indices: &[usize],
+    expressions: &[ScalarExpr],
+) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let mut fields = Vec::new();
+    let mut columns: Vec<ArrayRef> = Vec::new();
+
+    // Passthrough columns
+    for &i in column_indices {
+        fields.push(schema.field(i).clone());
+        columns.push(batch.column(i).clone());
+    }
+
+    // Computed expression columns
+    for (expr_idx, expr) in expressions.iter().enumerate() {
+        let array = evaluate_scalar_expr(batch, expr)?;
+        fields.push(Field::new(
+            format!("expr_{}", expr_idx),
+            array.data_type().clone(),
+            true,
+        ));
+        columns.push(array);
+    }
+
+    let out_schema = SchemaRef::new(Schema::new(fields));
+    Ok(RecordBatch::try_new(out_schema, columns)?)
 }
 
 // --- Internal helpers ---

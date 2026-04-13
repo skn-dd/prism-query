@@ -40,11 +40,17 @@ fn execute_node(
     tables: &HashMap<String, RecordBatch>,
 ) -> Result<Vec<RecordBatch>> {
     match node {
-        PlanNode::Scan { table_name, .. } => {
+        PlanNode::Scan { table_name, projection, .. } => {
             let batch = tables.get(table_name).ok_or_else(|| {
                 SubstraitError::Internal(format!("table '{}' not found in registry", table_name))
             })?;
-            Ok(vec![batch.clone()])
+            // Apply projection if specified
+            if let Some(proj_cols) = projection {
+                let projected = filter_project::project_batch(batch, proj_cols)?;
+                Ok(vec![projected])
+            } else {
+                Ok(vec![batch.clone()])
+            }
         }
 
         PlanNode::Filter { input, predicate } => {
@@ -57,11 +63,15 @@ fn execute_node(
             Ok(output)
         }
 
-        PlanNode::Project { input, columns } => {
+        PlanNode::Project { input, columns, expressions } => {
             let child_batches = execute_node(input, tables)?;
             let mut output = Vec::new();
             for batch in &child_batches {
-                output.push(filter_project::project_batch(batch, columns)?);
+                if expressions.is_empty() {
+                    output.push(filter_project::project_batch(batch, columns)?);
+                } else {
+                    output.push(filter_project::project_batch_with_exprs(batch, columns, expressions)?);
+                }
             }
             Ok(output)
         }

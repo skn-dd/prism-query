@@ -117,6 +117,15 @@ public class PrismFlightExecutor implements Closeable {
     }
 
     /**
+     * Fetch results as a FlightStream — zero-copy, no intermediate byte[] serialization.
+     */
+    public FlightStream fetchResultStream(int workerIndex, String resultKey) throws Exception {
+        FlightClient client = clients.get(workerIndex);
+        Ticket ticket = new Ticket(resultKey.getBytes(StandardCharsets.UTF_8));
+        return client.getStream(ticket);
+    }
+
+    /**
      * Fetch results from a worker by key.
      *
      * @return Arrow IPC bytes of the result

@@ -23,7 +23,7 @@ use substrait::proto::{
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
-use prism_executor::filter_project::{Predicate, ScalarValue};
+use prism_executor::filter_project::{ArithmeticOp, Predicate, ScalarExpr, ScalarValue};
 use prism_executor::hash_aggregate::{AggExpr, AggFunc};
 use prism_executor::hash_join::JoinType;
 use prism_executor::sort::{NullOrdering, SortDirection, SortKey};
@@ -122,15 +122,22 @@ fn consume_project(project: &ProjectRel) -> Result<PlanNode> {
         .ok_or_else(|| SubstraitError::MissingField("project.input".into()))?;
     let input_node = consume_rel(input)?;
 
-    let columns: Vec<usize> = project
-        .expressions
-        .iter()
-        .filter_map(|expr| extract_column_ref(expr))
-        .collect();
+    let mut columns: Vec<usize> = Vec::new();
+    let mut expressions: Vec<ScalarExpr> = Vec::new();
+
+    for expr in &project.expressions {
+        if let Some(col_idx) = extract_column_ref(expr) {
+            columns.push(col_idx);
+        } else if let Some(scalar_expr) = convert_expression_to_scalar_expr(expr) {
+            expressions.push(scalar_expr);
+        }
+        // Silently skip unrecognized expressions (backward compat)
+    }
 
     Ok(PlanNode::Project {
         input: Box::new(input_node),
         columns,
+        expressions,
     })
 }
 
@@ -282,17 +289,47 @@ fn convert_substrait_schema(
         .as_ref()
         .ok_or_else(|| SubstraitError::MissingField("read.base_schema".into()))?;
 
+    // Try to extract type info from the struct definition
+    let types: Vec<DataType> = named_struct
+        .r#struct
+        .as_ref()
+        .map(|s| {
+            s.types
+                .iter()
+                .map(|t| convert_substrait_type(t))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let fields: Vec<Field> = named_struct
         .names
         .iter()
         .enumerate()
-        .map(|(_i, name)| {
-            // Default to Utf8 if type info is missing (will be refined during execution)
-            Field::new(name, DataType::Utf8, true)
+        .map(|(i, name)| {
+            let dt = types.get(i).cloned().unwrap_or(DataType::Utf8);
+            Field::new(name, dt, true)
         })
         .collect();
 
     Ok(Arc::new(Schema::new(fields)))
+}
+
+fn convert_substrait_type(substrait_type: &substrait::proto::Type) -> DataType {
+    use substrait::proto::r#type::Kind;
+    match &substrait_type.kind {
+        Some(Kind::Bool(_)) => DataType::Boolean,
+        Some(Kind::I8(_)) => DataType::Int8,
+        Some(Kind::I16(_)) => DataType::Int16,
+        Some(Kind::I32(_)) => DataType::Int32,
+        Some(Kind::I64(_)) => DataType::Int64,
+        Some(Kind::Fp32(_)) => DataType::Float32,
+        Some(Kind::Fp64(_)) => DataType::Float64,
+        Some(Kind::String(_)) => DataType::Utf8,
+        Some(Kind::Date(_)) => DataType::Date32,
+        Some(Kind::Timestamp(_)) => DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+        Some(Kind::Decimal(d)) => DataType::Decimal128(d.precision as u8, d.scale as i8),
+        _ => DataType::Utf8, // fallback
+    }
 }
 
 fn extract_column_ref(expr: &Expression) -> Option<usize> {
@@ -405,6 +442,51 @@ fn convert_scalar_function_to_predicate(func: &ScalarFunction) -> Result<Predica
     )))
 }
 
+/// Convert a Substrait Expression into a ScalarExpr for arithmetic evaluation.
+fn convert_expression_to_scalar_expr(expr: &Expression) -> Option<ScalarExpr> {
+    match &expr.rex_type {
+        Some(RexType::Selection(_)) => {
+            extract_column_ref(expr).map(ScalarExpr::ColumnRef)
+        }
+        Some(RexType::Literal(_)) => {
+            extract_scalar_value(expr).map(ScalarExpr::Literal)
+        }
+        Some(RexType::ScalarFunction(func)) => {
+            let func_ref = func.function_reference;
+            let args: Vec<&Expression> = func.arguments.iter()
+                .filter_map(|a| match &a.arg_type {
+                    Some(substrait::proto::function_argument::ArgType::Value(e)) => Some(e),
+                    _ => None,
+                })
+                .collect();
+
+            match func_ref {
+                10 => binary_scalar_expr(ArithmeticOp::Add, &args),
+                11 => binary_scalar_expr(ArithmeticOp::Subtract, &args),
+                12 => binary_scalar_expr(ArithmeticOp::Multiply, &args),
+                13 => binary_scalar_expr(ArithmeticOp::Divide, &args),
+                14 if args.len() == 1 => {
+                    convert_expression_to_scalar_expr(args[0])
+                        .map(|inner| ScalarExpr::Negate(Box::new(inner)))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn binary_scalar_expr(op: ArithmeticOp, args: &[&Expression]) -> Option<ScalarExpr> {
+    if args.len() != 2 { return None; }
+    let left = convert_expression_to_scalar_expr(args[0])?;
+    let right = convert_expression_to_scalar_expr(args[1])?;
+    Some(ScalarExpr::BinaryOp {
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
+    })
+}
+
 fn extract_scalar_value(expr: &Expression) -> Option<ScalarValue> {
     match &expr.rex_type {
         Some(RexType::Literal(lit)) => match &lit.literal_type {
@@ -494,12 +576,15 @@ fn derive_schema(node: &PlanNode) -> Result<SchemaRef> {
     match node {
         PlanNode::Scan { schema, .. } => Ok(schema.clone()),
         PlanNode::Filter { input, .. } => derive_schema(input),
-        PlanNode::Project { input, columns } => {
+        PlanNode::Project { input, columns, expressions } => {
             let input_schema = derive_schema(input)?;
-            let fields: Vec<Field> = columns
+            let mut fields: Vec<Field> = columns
                 .iter()
                 .map(|&i| input_schema.field(i).clone())
                 .collect();
+            for (i, _expr) in expressions.iter().enumerate() {
+                fields.push(Field::new(format!("expr_{}", i), DataType::Float64, true));
+            }
             Ok(Arc::new(Schema::new(fields)))
         }
         PlanNode::Aggregate {

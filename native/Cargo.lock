@@ -2882,6 +2882,7 @@ dependencies = [
  "arrow-flight",
  "arrow-ipc 55.2.0",
  "arrow-schema 55.2.0",
+ "base64",
  "clap",
  "futures",
  "prism-executor",

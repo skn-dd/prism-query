@@ -2,7 +2,7 @@
 //! deserialization and actual Arrow execution.
 
 use arrow_schema::SchemaRef;
-use prism_executor::filter_project::Predicate;
+use prism_executor::filter_project::{Predicate, ScalarExpr};
 use prism_executor::hash_aggregate::AggExpr;
 use prism_executor::hash_join::JoinType;
 use prism_executor::sort::SortKey;
@@ -23,10 +23,11 @@ pub enum PlanNode {
         predicate: Predicate,
     },
 
-    /// Projection — selects and computes output columns.
+    /// Projection — selects existing columns and computes new ones.
     Project {
         input: Box<PlanNode>,
         columns: Vec<usize>,
+        expressions: Vec<ScalarExpr>,
     },
 
     /// Hash aggregation.
