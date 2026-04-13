@@ -62,15 +62,20 @@ impl ActionHandler for QueryHandler {
             let sf = command["sf"].as_f64().unwrap_or(1.0);
             let store_key = command["store_key"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("datagen: missing 'store_key' field"))?;
+            let chunk_size = command["chunk_size"].as_u64().unwrap_or(5_000_000) as usize;
 
             let start = Instant::now();
-            let batch = match table {
-                "lineitem" => datagen::make_lineitem(sf),
-                "orders" => datagen::make_orders(sf),
+            let batches = match table {
+                "lineitem" => datagen::make_lineitem_chunked(sf, chunk_size),
+                "orders" => datagen::make_orders_chunked(sf, chunk_size),
                 other => return Err(anyhow::anyhow!("datagen: unknown table '{}'", other)),
             };
-            let rows = batch.num_rows();
-            store.put(store_key, batch).await;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            // Clear any existing data at this key, then store chunks
+            store.clear(store_key).await;
+            for batch in batches {
+                store.put(store_key, batch).await;
+            }
             let elapsed = start.elapsed();
 
             tracing::info!(
