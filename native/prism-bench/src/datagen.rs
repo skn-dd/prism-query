@@ -1,9 +1,15 @@
 //! TPC-H data generators with scale factor support.
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
+use arrow::compute::concat_batches;
+use arrow_array::{Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SortOptions};
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 
 /// Generate TPC-H lineitem table as a single RecordBatch.
 /// SF1 = 6_000_000 rows, SF0.1 = 600_000 rows.
@@ -66,6 +72,19 @@ pub fn make_lineitem_shard(row_count: usize, row_offset: usize, chunk_size: usiz
                 Arc::new(StringArray::from(
                     (g_start..g_end).map(|i| statuses[i % 2]).collect::<Vec<_>>(),
                 )),
+                // l_shipdate: dates in range 1992-01-01 to 1998-12-01 (days since epoch)
+                // 1992-01-01 = 8035 days since 1970-01-01, 1998-12-01 = 10562
+                Arc::new(Date32Array::from(
+                    (g_start..g_end).map(|i| 8035 + (i % 2527) as i32).collect::<Vec<_>>(),
+                )),
+                // l_commitdate: shipdate + 30-90 days
+                Arc::new(Date32Array::from(
+                    (g_start..g_end).map(|i| 8035 + (i % 2527) as i32 + 30 + (i % 60) as i32).collect::<Vec<_>>(),
+                )),
+                // l_receiptdate: commitdate + 1-30 days
+                Arc::new(Date32Array::from(
+                    (g_start..g_end).map(|i| 8035 + (i % 2527) as i32 + 30 + (i % 60) as i32 + 1 + (i % 30) as i32).collect::<Vec<_>>(),
+                )),
             ],
         )
         .unwrap();
@@ -87,6 +106,9 @@ pub fn lineitem_schema() -> Arc<Schema> {
         Field::new("l_tax", DataType::Float64, false),
         Field::new("l_returnflag", DataType::Utf8, false),
         Field::new("l_linestatus", DataType::Utf8, false),
+        Field::new("l_shipdate", DataType::Date32, false),
+        Field::new("l_commitdate", DataType::Date32, false),
+        Field::new("l_receiptdate", DataType::Date32, false),
     ]))
 }
 
@@ -135,6 +157,10 @@ pub fn make_orders_shard(row_count: usize, row_offset: usize, chunk_size: usize)
                 Arc::new(StringArray::from(
                     (g_start..g_end).map(|i| priorities[i % 5]).collect::<Vec<_>>(),
                 )),
+                // o_orderdate: dates in range 1992-01-01 to 1998-08-02
+                Arc::new(Date32Array::from(
+                    (g_start..g_end).map(|i| 8035 + (i % 2405) as i32).collect::<Vec<_>>(),
+                )),
             ],
         )
         .unwrap();
@@ -151,5 +177,115 @@ pub fn orders_schema() -> Arc<Schema> {
         Field::new("o_orderstatus", DataType::Utf8, false),
         Field::new("o_totalprice", DataType::Float64, false),
         Field::new("o_orderpriority", DataType::Utf8, false),
+        Field::new("o_orderdate", DataType::Date32, false),
     ]))
+}
+
+// ─── Parquet writers ─────────────────────────────────────────────────
+
+/// Write lineitem data as a sorted Parquet file.
+/// Sorts by (l_discount, l_quantity) so row groups have tight min/max ranges
+/// for effective row group skipping on filter queries.
+pub fn write_lineitem_parquet(
+    output_dir: &Path,
+    row_count: usize,
+    row_offset: usize,
+    row_group_size: usize,
+) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(output_dir)?;
+    let file_path = output_dir.join("lineitem.parquet");
+
+    // Generate data in memory, then sort
+    let batches = make_lineitem_shard(row_count, row_offset, row_count.min(5_000_000));
+    let schema = lineitem_schema();
+    let all_data = concat_batches(&schema, &batches)?;
+
+    // Sort by l_discount (col 6) then l_quantity (col 4) for filter pushdown
+    let sort_cols = vec![
+        arrow::compute::SortColumn {
+            values: all_data.column(6).clone(),
+            options: Some(SortOptions::default()),
+        },
+        arrow::compute::SortColumn {
+            values: all_data.column(4).clone(),
+            options: Some(SortOptions::default()),
+        },
+    ];
+    let indices = arrow::compute::lexsort_to_indices(&sort_cols, None)?;
+    let sorted_columns: Vec<_> = all_data
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c, &indices, None).unwrap())
+        .collect();
+    let sorted = RecordBatch::try_new(schema.clone(), sorted_columns)?;
+
+    // Write as Parquet with configured row group size
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_max_row_group_size(row_group_size)
+        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
+        .build();
+
+    let file = fs::File::create(&file_path)?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    writer.write(&sorted)?;
+    writer.close()?;
+
+    tracing::info!(
+        "Wrote {} rows to {:?} (sorted by l_discount, l_quantity, row_group_size={})",
+        row_count,
+        file_path,
+        row_group_size,
+    );
+
+    Ok(file_path)
+}
+
+/// Write orders data as a sorted Parquet file.
+/// Sorts by (o_orderstatus) for predicate pushdown on status filters.
+pub fn write_orders_parquet(
+    output_dir: &Path,
+    row_count: usize,
+    row_offset: usize,
+    row_group_size: usize,
+) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(output_dir)?;
+    let file_path = output_dir.join("orders.parquet");
+
+    let batches = make_orders_shard(row_count, row_offset, row_count.min(5_000_000));
+    let schema = orders_schema();
+    let all_data = concat_batches(&schema, &batches)?;
+
+    // Sort by o_orderstatus (col 2)
+    let sort_cols = vec![arrow::compute::SortColumn {
+        values: all_data.column(2).clone(),
+        options: Some(SortOptions::default()),
+    }];
+    let indices = arrow::compute::lexsort_to_indices(&sort_cols, None)?;
+    let sorted_columns: Vec<_> = all_data
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c, &indices, None).unwrap())
+        .collect();
+    let sorted = RecordBatch::try_new(schema.clone(), sorted_columns)?;
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_max_row_group_size(row_group_size)
+        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
+        .build();
+
+    let file = fs::File::create(&file_path)?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    writer.write(&sorted)?;
+    writer.close()?;
+
+    tracing::info!(
+        "Wrote {} rows to {:?} (sorted by o_orderstatus, row_group_size={})",
+        row_count,
+        file_path,
+        row_group_size,
+    );
+
+    Ok(file_path)
 }

@@ -20,6 +20,7 @@ datafusion-physical-expr = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+parquet = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

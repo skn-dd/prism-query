@@ -134,10 +134,18 @@ pub fn hash_join(
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(RecordBatch::try_new(probe_batch.schema(), columns)?)
         }
-        _ => Err(PrismError::Join(format!(
-            "{:?} join not yet implemented",
-            config.join_type
-        ))),
+        JoinType::Right => {
+            // Right join: all build rows preserved, unmatched get nulls on probe side
+            let (p_idx, b_idx) =
+                right_join_indices(build_batch.num_rows(), &probe_idx, &build_idx);
+            assemble_joined_batch_nullable_probe(probe_batch, &p_idx, build_batch, &b_idx)
+        }
+        JoinType::Full => {
+            // Full outer join: all rows from both sides preserved
+            let (p_idx, b_idx) =
+                full_join_indices(probe_batch.num_rows(), build_batch.num_rows(), &probe_idx, &build_idx);
+            assemble_joined_batch_both_nullable(probe_batch, &p_idx, build_batch, &b_idx)
+        }
     }
 }
 
@@ -250,6 +258,140 @@ fn semi_join_mask(probe_rows: usize, matched_probe: &UInt32Array) -> Vec<bool> {
         mask[matched_probe.value(i) as usize] = true;
     }
     mask
+}
+
+/// For RIGHT JOIN: all build rows preserved; unmatched build rows get null probe indices.
+/// Returns (probe_indices, build_indices) where probe_indices uses null for unmatched.
+fn right_join_indices(
+    build_rows: usize,
+    matched_probe: &UInt32Array,
+    matched_build: &UInt32Array,
+) -> (UInt32Array, UInt32Array) {
+    let mut probe_out = Vec::new();
+    let mut build_out = Vec::new();
+    let mut build_matched = vec![false; build_rows];
+
+    // Include all matched pairs
+    for i in 0..matched_probe.len() {
+        probe_out.push(Some(matched_probe.value(i)));
+        build_out.push(matched_build.value(i));
+        build_matched[matched_build.value(i) as usize] = true;
+    }
+
+    // Include unmatched build rows with null probe
+    for row in 0..build_rows {
+        if !build_matched[row] {
+            probe_out.push(None);
+            build_out.push(row as u32);
+        }
+    }
+
+    // For probe: use nullable UInt32Array
+    let probe_arr: UInt32Array = probe_out.into_iter().collect();
+    let build_arr = UInt32Array::from(build_out);
+    (probe_arr, build_arr)
+}
+
+/// For FULL JOIN: all rows from both sides.
+fn full_join_indices(
+    probe_rows: usize,
+    build_rows: usize,
+    matched_probe: &UInt32Array,
+    matched_build: &UInt32Array,
+) -> (UInt32Array, UInt32Array) {
+    let mut probe_out: Vec<Option<u32>> = Vec::new();
+    let mut build_out: Vec<Option<u32>> = Vec::new();
+    let mut probe_matched = vec![false; probe_rows];
+    let mut build_matched = vec![false; build_rows];
+
+    // Include all matched pairs
+    for i in 0..matched_probe.len() {
+        let p = matched_probe.value(i);
+        let b = matched_build.value(i);
+        probe_matched[p as usize] = true;
+        build_matched[b as usize] = true;
+        probe_out.push(Some(p));
+        build_out.push(Some(b));
+    }
+
+    // Include unmatched probe rows (null on build side)
+    for row in 0..probe_rows {
+        if !probe_matched[row] {
+            probe_out.push(Some(row as u32));
+            build_out.push(None);
+        }
+    }
+
+    // Include unmatched build rows (null on probe side)
+    for row in 0..build_rows {
+        if !build_matched[row] {
+            probe_out.push(None);
+            build_out.push(Some(row as u32));
+        }
+    }
+
+    let probe_arr: UInt32Array = probe_out.into_iter().collect();
+    let build_arr: UInt32Array = build_out.into_iter().collect();
+    (probe_arr, build_arr)
+}
+
+/// Assemble joined batch where probe indices may be null (RIGHT JOIN).
+fn assemble_joined_batch_nullable_probe(
+    probe: &RecordBatch,
+    probe_idx: &UInt32Array,
+    build: &RecordBatch,
+    build_idx: &UInt32Array,
+) -> Result<RecordBatch> {
+    let mut columns = Vec::new();
+    let mut fields = Vec::new();
+
+    // Probe side: use take which handles null indices -> null output values
+    for (i, field) in probe.schema().fields().iter().enumerate() {
+        let f = Field::new(field.name(), field.data_type().clone(), true); // nullable
+        fields.push(Arc::new(f));
+        columns.push(compute::take(probe.column(i), probe_idx, None)?);
+    }
+
+    for (i, field) in build.schema().fields().iter().enumerate() {
+        let mut f = field.as_ref().clone();
+        if probe.schema().field_with_name(f.name()).is_ok() {
+            f = Field::new(format!("{}_right", f.name()), f.data_type().clone(), f.is_nullable());
+        }
+        fields.push(Arc::new(f));
+        columns.push(compute::take(build.column(i), build_idx, None)?);
+    }
+
+    let schema = SchemaRef::new(Schema::new(fields));
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+/// Assemble joined batch where both sides may have null indices (FULL JOIN).
+fn assemble_joined_batch_both_nullable(
+    probe: &RecordBatch,
+    probe_idx: &UInt32Array,
+    build: &RecordBatch,
+    build_idx: &UInt32Array,
+) -> Result<RecordBatch> {
+    let mut columns = Vec::new();
+    let mut fields = Vec::new();
+
+    for (i, field) in probe.schema().fields().iter().enumerate() {
+        let f = Field::new(field.name(), field.data_type().clone(), true);
+        fields.push(Arc::new(f));
+        columns.push(compute::take(probe.column(i), probe_idx, None)?);
+    }
+
+    for (i, field) in build.schema().fields().iter().enumerate() {
+        let mut f = field.as_ref().clone();
+        if probe.schema().field_with_name(f.name()).is_ok() {
+            f = Field::new(format!("{}_right", f.name()), f.data_type().clone(), true);
+        }
+        fields.push(Arc::new(f));
+        columns.push(compute::take(build.column(i), build_idx, None)?);
+    }
+
+    let schema = SchemaRef::new(Schema::new(fields));
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 fn keys_equal(

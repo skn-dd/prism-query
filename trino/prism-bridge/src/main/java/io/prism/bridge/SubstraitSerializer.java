@@ -41,6 +41,10 @@ public class SubstraitSerializer {
     public static final int FUNC_DIVIDE = 13;
     public static final int FUNC_NEGATE = 14;
 
+    // String function reference IDs — must match consumer.rs
+    public static final int FUNC_LIKE = 20;
+    public static final int FUNC_ILIKE = 21;
+
     // Aggregate function reference IDs — must match consumer.rs
     public static final int AGG_COUNT = 0;
     public static final int AGG_SUM = 1;
@@ -284,6 +288,7 @@ public class SubstraitSerializer {
                     serializePredicate(or.left()),
                     serializePredicate(or.right()));
             case PredicateNode.Not not -> makeNot(serializePredicate(not.inner()));
+            case PredicateNode.Like like -> serializeLike(like);
         };
     }
 
@@ -298,6 +303,21 @@ public class SubstraitSerializer {
                                 .build())
                         .addArguments(FunctionArgument.newBuilder()
                                 .setValue(makeLiteral(comp.value(), comp.valueType()))
+                                .build())
+                        .build())
+                .build();
+    }
+
+    private static Expression serializeLike(PredicateNode.Like like) {
+        int funcRef = like.caseInsensitive() ? FUNC_ILIKE : FUNC_LIKE;
+        return Expression.newBuilder()
+                .setScalarFunction(Expression.ScalarFunction.newBuilder()
+                        .setFunctionReference(funcRef)
+                        .addArguments(FunctionArgument.newBuilder()
+                                .setValue(makeColumnRef(like.columnIndex()))
+                                .build())
+                        .addArguments(FunctionArgument.newBuilder()
+                                .setValue(makeLiteral(like.pattern(), "STRING"))
                                 .build())
                         .build())
                 .build();
@@ -332,6 +352,7 @@ public class SubstraitSerializer {
             case "INTEGER", "I32" -> lit.setI32(((Number) value).intValue());
             case "DOUBLE", "FP64" -> lit.setFp64(((Number) value).doubleValue());
             case "BOOLEAN" -> lit.setBoolean((Boolean) value);
+            case "DATE" -> lit.setDate(((Number) value).intValue());
             default -> lit.setString(value.toString());
         }
 

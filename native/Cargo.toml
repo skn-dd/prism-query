@@ -29,6 +29,9 @@ arrow-schema = "55"
 arrow-select = "55"
 arrow-string = "55"
 
+# Parquet columnar storage
+parquet = { version = "55", default-features = false, features = ["arrow", "snap"] }
+
 # DataFusion (for expression evaluation and utilities)
 datafusion = "46"
 datafusion-common = "46"

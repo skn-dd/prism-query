@@ -148,11 +148,15 @@ fn execute_plan_node(
             Ok(output)
         }
 
-        PlanNode::Project { input, columns } => {
+        PlanNode::Project { input, columns, expressions } => {
             let child_batches = execute_plan_node(input, input_batches)?;
             let mut output = Vec::new();
             for batch in &child_batches {
-                output.push(filter_project::project_batch(batch, columns)?);
+                if expressions.is_empty() {
+                    output.push(filter_project::project_batch(batch, columns)?);
+                } else {
+                    output.push(filter_project::project_batch_with_exprs(batch, columns, expressions)?);
+                }
             }
             Ok(output)
         }

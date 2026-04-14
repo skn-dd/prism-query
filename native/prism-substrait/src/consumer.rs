@@ -477,6 +477,19 @@ fn convert_scalar_function_to_predicate(func: &ScalarFunction) -> Result<Predica
         return Ok(Predicate::Not(Box::new(inner)));
     }
 
+    // LIKE / ILIKE predicates
+    if args.len() == 2 && (func_ref == 20 || func_ref == 21) {
+        let col = extract_column_ref(args[0]);
+        let pattern = extract_scalar_value(args[1]);
+        if let (Some(col_idx), Some(ScalarValue::Utf8(pat))) = (col, pattern) {
+            return if func_ref == 20 {
+                Ok(Predicate::Like(col_idx, pat))
+            } else {
+                Ok(Predicate::ILike(col_idx, pat))
+            };
+        }
+    }
+
     Err(SubstraitError::UnsupportedExpression(format!(
         "scalar function ref={} with {} args",
         func_ref,
@@ -537,6 +550,7 @@ fn extract_scalar_value(expr: &Expression) -> Option<ScalarValue> {
             Some(LiteralType::Fp64(v)) => Some(ScalarValue::Float64(*v)),
             Some(LiteralType::String(v)) => Some(ScalarValue::Utf8(v.clone())),
             Some(LiteralType::Boolean(v)) => Some(ScalarValue::Boolean(*v)),
+            Some(LiteralType::Date(v)) => Some(ScalarValue::Date32(*v)),
             _ => None,
         },
         _ => None,

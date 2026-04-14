@@ -7,6 +7,7 @@ pub mod error;
 pub mod filter_project;
 pub mod hash_aggregate;
 pub mod hash_join;
+pub mod parquet_scan;
 pub mod sort;
 pub mod string_ops;
 

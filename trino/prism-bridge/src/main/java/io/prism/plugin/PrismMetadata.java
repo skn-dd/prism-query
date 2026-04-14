@@ -1,6 +1,9 @@
 package io.prism.plugin;
 
 import io.trino.spi.connector.*;
+import io.trino.spi.connector.JoinApplicationResult;
+import io.trino.spi.connector.JoinStatistics;
+import io.trino.spi.connector.LimitApplicationResult;
 import io.trino.spi.connector.SortItem;
 import io.trino.spi.connector.TopNApplicationResult;
 import io.trino.spi.expression.Call;
@@ -30,14 +33,18 @@ public class PrismMetadata implements ConnectorMetadata {
             new ColumnDef("l_discount", DoubleType.DOUBLE),
             new ColumnDef("l_tax", DoubleType.DOUBLE),
             new ColumnDef("l_returnflag", VarcharType.VARCHAR),
-            new ColumnDef("l_linestatus", VarcharType.VARCHAR)
+            new ColumnDef("l_linestatus", VarcharType.VARCHAR),
+            new ColumnDef("l_shipdate", DateType.DATE),
+            new ColumnDef("l_commitdate", DateType.DATE),
+            new ColumnDef("l_receiptdate", DateType.DATE)
         ),
         "orders", List.of(
             new ColumnDef("o_orderkey", BigintType.BIGINT),
             new ColumnDef("o_custkey", BigintType.BIGINT),
             new ColumnDef("o_orderstatus", VarcharType.VARCHAR),
             new ColumnDef("o_totalprice", DoubleType.DOUBLE),
-            new ColumnDef("o_orderpriority", VarcharType.VARCHAR)
+            new ColumnDef("o_orderpriority", VarcharType.VARCHAR),
+            new ColumnDef("o_orderdate", DateType.DATE)
         )
     );
 
@@ -164,6 +171,18 @@ public class PrismMetadata implements ConnectorMetadata {
                     : new PrismPlanNode.PredicateNode.And(predicate, colPredicate);
         }
 
+        // Try to extract expression-based predicates (LIKE, etc.)
+        try {
+            PrismPlanNode.PredicateNode exprPredicate = convertExpressionPredicate(
+                    constraint.getExpression(), handle);
+            if (exprPredicate != null) {
+                predicate = (predicate == null) ? exprPredicate
+                        : new PrismPlanNode.PredicateNode.And(predicate, exprPredicate);
+            }
+        } catch (Exception e) {
+            // constraint.getExpression() may not be available; skip gracefully
+        }
+
         if (predicate == null) {
             return Optional.empty();
         }
@@ -240,6 +259,12 @@ public class PrismMetadata implements ConnectorMetadata {
 
     private Object convertTrinoValue(Type type, Object value) {
         if (value == null) return null;
+        if (type instanceof DateType) {
+            if (value instanceof Long) return ((Long) value).intValue();
+            if (value instanceof Integer) return value;
+            if (value instanceof Number) return ((Number) value).intValue();
+            return value;
+        }
         if (type instanceof DoubleType) {
             if (value instanceof Double) return value;
             if (value instanceof Long) return Double.longBitsToDouble((Long) value);
@@ -270,8 +295,48 @@ public class PrismMetadata implements ConnectorMetadata {
         if (type instanceof IntegerType) return "INTEGER";
         if (type instanceof DoubleType) return "DOUBLE";
         if (type instanceof BooleanType) return "BOOLEAN";
+        if (type instanceof DateType) return "DATE";
         if (type instanceof VarcharType) return "STRING";
         return "STRING";
+    }
+
+    private PrismPlanNode.PredicateNode convertExpressionPredicate(
+            ConnectorExpression expr,
+            PrismTableHandle handle) {
+        if (expr instanceof Call call) {
+            String funcName = call.getFunctionName().getName();
+            List<ConnectorExpression> args = call.getArguments();
+
+            // LIKE: $like(column, pattern)
+            if ("$like".equals(funcName) && args.size() == 2) {
+                if (args.get(0) instanceof Variable var && args.get(1) instanceof Constant pattern) {
+                    int colIdx = findColumnIndex(handle.getTableName(), var.getName());
+                    if (colIdx >= 0 && pattern.getValue() != null) {
+                        String patternStr = convertTrinoValue(pattern.getType(), pattern.getValue()).toString();
+                        return new PrismPlanNode.PredicateNode.Like(colIdx, patternStr, false);
+                    }
+                }
+            }
+
+            // AND of predicates
+            if ("$and".equals(funcName) && args.size() == 2) {
+                PrismPlanNode.PredicateNode left = convertExpressionPredicate(args.get(0), handle);
+                PrismPlanNode.PredicateNode right = convertExpressionPredicate(args.get(1), handle);
+                if (left != null && right != null) {
+                    return new PrismPlanNode.PredicateNode.And(left, right);
+                }
+            }
+        }
+        return null; // Can't push this expression
+    }
+
+    private int findColumnIndex(String tableName, String columnName) {
+        List<ColumnDef> defs = TPCH_TABLES.get(tableName);
+        if (defs == null) return -1;
+        for (int i = 0; i < defs.size(); i++) {
+            if (defs.get(i).name().equals(columnName)) return i;
+        }
+        return -1;
     }
 
     // ===== Projection Pushdown =====
@@ -523,6 +588,146 @@ public class PrismMetadata implements ConnectorMetadata {
         PrismTableHandle newHandle = handle.withPushedPlan(sortPlan);
 
         return Optional.of(new TopNApplicationResult<>(newHandle, true, false));
+    }
+
+    // ===== Join Pushdown =====
+
+    @Override
+    public Optional<JoinApplicationResult<ConnectorTableHandle>> applyJoin(
+            ConnectorSession session,
+            JoinType joinType,
+            ConnectorTableHandle left,
+            ConnectorTableHandle right,
+            ConnectorExpression joinCondition,
+            Map<String, ColumnHandle> leftAssignments,
+            Map<String, ColumnHandle> rightAssignments,
+            JoinStatistics statistics) {
+        PrismTableHandle leftHandle = (PrismTableHandle) left;
+        PrismTableHandle rightHandle = (PrismTableHandle) right;
+
+        // Extract equi-join keys from the join condition
+        List<Integer> leftKeys = new ArrayList<>();
+        List<Integer> rightKeys = new ArrayList<>();
+
+        if (!extractJoinKeys(joinCondition, leftAssignments, rightAssignments, leftKeys, rightKeys)) {
+            return Optional.empty(); // Can't push non-equi joins
+        }
+
+        if (leftKeys.isEmpty()) {
+            return Optional.empty(); // Need at least one equi-join key
+        }
+
+        // Map Trino JoinType to our internal string representation
+        String prismJoinType = switch (joinType) {
+            case INNER -> "INNER";
+            case LEFT_OUTER -> "LEFT";
+            case RIGHT_OUTER -> "RIGHT";
+            case FULL_OUTER -> "FULL";
+        };
+
+        // Build the join plan node
+        PrismPlanNode leftPlan = leftHandle.getPushedPlan()
+                .orElseGet(() -> buildFullScan(leftHandle.getTableName()));
+        PrismPlanNode rightPlan = rightHandle.getPushedPlan()
+                .orElseGet(() -> buildFullScan(rightHandle.getTableName()));
+
+        PrismPlanNode joinPlan = new PrismPlanNode.Join(leftPlan, rightPlan, prismJoinType, leftKeys, rightKeys);
+
+        // Create a new table handle that carries the joined plan
+        // Use left table as the "primary" table name
+        PrismTableHandle joinHandle = new PrismTableHandle(
+                leftHandle.getSchemaName(), leftHandle.getTableName())
+                .withPushedPlan(joinPlan);
+
+        // Build output column mappings: new output handle -> original input handle
+        Map<ColumnHandle, ColumnHandle> leftColumnMapping = new LinkedHashMap<>();
+        Map<ColumnHandle, ColumnHandle> rightColumnMapping = new LinkedHashMap<>();
+        int outputIdx = 0;
+
+        // Left side columns
+        for (var entry : leftAssignments.entrySet()) {
+            PrismColumnHandle col = (PrismColumnHandle) entry.getValue();
+            PrismColumnHandle outputCol = new PrismColumnHandle(entry.getKey(), outputIdx++, col.getType());
+            leftColumnMapping.put(outputCol, col);
+        }
+
+        // Right side columns
+        for (var entry : rightAssignments.entrySet()) {
+            PrismColumnHandle col = (PrismColumnHandle) entry.getValue();
+            PrismColumnHandle outputCol = new PrismColumnHandle(entry.getKey(), outputIdx++, col.getType());
+            rightColumnMapping.put(outputCol, col);
+        }
+
+        return Optional.of(new JoinApplicationResult<>(
+                joinHandle,
+                leftColumnMapping,
+                rightColumnMapping,
+                false));
+    }
+
+    private boolean extractJoinKeys(
+            ConnectorExpression condition,
+            Map<String, ColumnHandle> leftAssignments,
+            Map<String, ColumnHandle> rightAssignments,
+            List<Integer> leftKeys,
+            List<Integer> rightKeys) {
+        if (condition instanceof Call call) {
+            String funcName = call.getFunctionName().getName();
+            List<ConnectorExpression> args = call.getArguments();
+
+            if ("$equal".equals(funcName) && args.size() == 2) {
+                // Equi-join: left_col = right_col
+                if (args.get(0) instanceof Variable leftVar && args.get(1) instanceof Variable rightVar) {
+                    ColumnHandle leftCh = leftAssignments.get(leftVar.getName());
+                    ColumnHandle rightCh = rightAssignments.get(rightVar.getName());
+                    if (leftCh instanceof PrismColumnHandle lpc && rightCh instanceof PrismColumnHandle rpc) {
+                        leftKeys.add(lpc.getColumnIndex());
+                        rightKeys.add(rpc.getColumnIndex());
+                        return true;
+                    }
+                    // Try reversed: right_col = left_col
+                    leftCh = leftAssignments.get(rightVar.getName());
+                    rightCh = rightAssignments.get(leftVar.getName());
+                    if (leftCh instanceof PrismColumnHandle lpc && rightCh instanceof PrismColumnHandle rpc) {
+                        leftKeys.add(lpc.getColumnIndex());
+                        rightKeys.add(rpc.getColumnIndex());
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            if ("$and".equals(funcName) && args.size() == 2) {
+                // AND chain of equi-join conditions
+                boolean leftOk = extractJoinKeys(args.get(0), leftAssignments, rightAssignments, leftKeys, rightKeys);
+                boolean rightOk = extractJoinKeys(args.get(1), leftAssignments, rightAssignments, leftKeys, rightKeys);
+                return leftOk && rightOk;
+            }
+        }
+        return false;
+    }
+
+    // ===== Limit Pushdown =====
+
+    @Override
+    public Optional<LimitApplicationResult<ConnectorTableHandle>> applyLimit(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            long limit) {
+        PrismTableHandle handle = (PrismTableHandle) table;
+
+        if (limit <= 0 || limit > Integer.MAX_VALUE) {
+            return Optional.empty();
+        }
+
+        PrismPlanNode currentPlan = handle.getPushedPlan()
+                .orElseGet(() -> buildFullScan(handle.getTableName()));
+
+        // Wrap in Sort with empty keys and limit (pure LIMIT, no ordering)
+        PrismPlanNode limitPlan = new PrismPlanNode.Sort(currentPlan, List.of(), limit);
+        PrismTableHandle newHandle = handle.withPushedPlan(limitPlan);
+
+        return Optional.of(new LimitApplicationResult<>(newHandle, false, false));
     }
 
     // ===== Expression Conversion =====

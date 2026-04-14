@@ -76,6 +76,7 @@ public sealed interface PrismPlanNode {
         @JsonSubTypes.Type(value = PredicateNode.And.class, name = "and"),
         @JsonSubTypes.Type(value = PredicateNode.Or.class, name = "or"),
         @JsonSubTypes.Type(value = PredicateNode.Not.class, name = "not"),
+        @JsonSubTypes.Type(value = PredicateNode.Like.class, name = "like"),
     })
     sealed interface PredicateNode {
         record Comparison(
@@ -97,6 +98,12 @@ public sealed interface PrismPlanNode {
 
         record Not(
             @JsonProperty("inner") PredicateNode inner
+        ) implements PredicateNode {}
+
+        record Like(
+            @JsonProperty("columnIndex") int columnIndex,
+            @JsonProperty("pattern") String pattern,
+            @JsonProperty("caseInsensitive") boolean caseInsensitive
         ) implements PredicateNode {}
     }
 

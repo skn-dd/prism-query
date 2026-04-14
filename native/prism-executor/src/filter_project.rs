@@ -41,6 +41,10 @@ pub enum Predicate {
     Or(Box<Predicate>, Box<Predicate>),
     /// NOT of a predicate
     Not(Box<Predicate>),
+    /// SQL LIKE pattern match
+    Like(usize, String),
+    /// SQL ILIKE (case-insensitive LIKE)
+    ILike(usize, String),
 }
 
 /// Scalar value for predicate comparison.
@@ -51,6 +55,7 @@ pub enum ScalarValue {
     Float64(f64),
     Utf8(String),
     Boolean(bool),
+    Date32(i32), // days since epoch
 }
 
 /// Evaluate a predicate against a RecordBatch, producing a boolean selection mask.
@@ -83,6 +88,30 @@ pub fn evaluate_predicate(batch: &RecordBatch, predicate: &Predicate) -> Result<
         Predicate::Not(inner) => {
             let mask = evaluate_predicate(batch, inner)?;
             Ok(compute::not(&mask)?)
+        }
+        Predicate::Like(col, pattern) => {
+            let array = batch.column(*col);
+            match array.data_type() {
+                DataType::Utf8 => {
+                    let str_arr = array.as_string::<i32>();
+                    Ok(crate::string_ops::string_like(str_arr, pattern)?)
+                }
+                _ => Err(PrismError::InvalidArgument(format!(
+                    "LIKE requires Utf8 column, got {:?}", array.data_type()
+                ))),
+            }
+        }
+        Predicate::ILike(col, pattern) => {
+            let array = batch.column(*col);
+            match array.data_type() {
+                DataType::Utf8 => {
+                    let str_arr = array.as_string::<i32>();
+                    Ok(crate::string_ops::string_ilike(str_arr, pattern)?)
+                }
+                _ => Err(PrismError::InvalidArgument(format!(
+                    "ILIKE requires Utf8 column, got {:?}", array.data_type()
+                ))),
+            }
         }
     }
 }
@@ -173,6 +202,7 @@ pub fn evaluate_scalar_expr(batch: &RecordBatch, expr: &ScalarExpr) -> Result<Ar
                 ScalarValue::Float64(v) => Arc::new(Float64Array::from(vec![*v; len])),
                 ScalarValue::Int64(v) => Arc::new(arrow_array::Int64Array::from(vec![*v; len])),
                 ScalarValue::Int32(v) => Arc::new(arrow_array::Int32Array::from(vec![*v; len])),
+                ScalarValue::Date32(v) => Arc::new(arrow_array::Date32Array::from(vec![*v; len])),
                 _ => return Err(PrismError::InvalidArgument(
                     format!("unsupported literal type in scalar expr: {:?}", val),
                 )),
@@ -274,6 +304,17 @@ fn compare_column(
         (DataType::Utf8, ScalarValue::Utf8(v)) => {
             let arr = array.as_string::<i32>();
             let scalar_arr = arrow_array::StringArray::new_scalar(v);
+            apply_cmp(arr as &dyn Datum, &scalar_arr as &dyn Datum, op)
+        }
+        (DataType::Date32, ScalarValue::Date32(v)) => {
+            let arr = array.as_primitive::<arrow_array::types::Date32Type>();
+            let scalar_arr = arrow_array::Date32Array::new_scalar(*v);
+            apply_cmp(arr as &dyn Datum, &scalar_arr as &dyn Datum, op)
+        }
+        // Allow Int32 scalar to compare against Date32 column (Trino sends dates as ints)
+        (DataType::Date32, ScalarValue::Int32(v)) => {
+            let arr = array.as_primitive::<arrow_array::types::Date32Type>();
+            let scalar_arr = arrow_array::Date32Array::new_scalar(*v);
             apply_cmp(arr as &dyn Datum, &scalar_arr as &dyn Datum, op)
         }
         _ => Err(PrismError::InvalidArgument(format!(

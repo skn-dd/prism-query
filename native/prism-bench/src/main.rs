@@ -3,6 +3,7 @@
 //!
 //! Usage:
 //!   prism-worker --port 50051
+//!   prism-worker --port 50051 --data-dir /data/prism
 //!
 //! The worker exposes three Flight endpoints:
 //!   - DoPut:    Receive Arrow RecordBatches (table data from coordinator)
@@ -13,6 +14,7 @@ mod handler;
 mod queries;
 mod datagen;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_flight::flight_service_server::FlightServiceServer;
@@ -28,6 +30,12 @@ struct Args {
     /// Port to listen on
     #[arg(long, default_value = "50051")]
     port: u16,
+
+    /// Directory for Parquet data files.
+    /// When set, the worker checks for Parquet files at {data-dir}/{store_key}/
+    /// before falling back to the in-memory PartitionStore.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -41,7 +49,15 @@ async fn main() -> anyhow::Result<()> {
     let service = ShuffleFlightService::new(store.clone());
 
     // Register the query execution handler
-    service.set_action_handler(Box::new(QueryHandler::new())).await;
+    let handler = match args.data_dir {
+        Some(ref dir) => {
+            tracing::info!("Parquet data directory: {:?}", dir);
+            eprintln!("Parquet data directory: {:?}", dir);
+            QueryHandler::with_data_dir(dir.clone())
+        }
+        None => QueryHandler::new(),
+    };
+    service.set_action_handler(Box::new(handler)).await;
 
     tracing::info!("Prism worker listening on {}", addr);
     eprintln!("Prism worker listening on {}", addr);
