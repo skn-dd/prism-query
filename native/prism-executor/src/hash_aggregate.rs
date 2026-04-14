@@ -3,14 +3,16 @@
 //! Replaces Trino's `FlatHash` / `BigintGroupByHash`. Groups rows by key columns
 //! and computes aggregate functions using vectorized Arrow compute kernels.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use arrow::compute::kernels::aggregate as arrow_agg;
 use arrow_array::{
     cast::AsArray, Array, ArrayRef, Float64Array, Int64Array, RecordBatch,
     types::{Float32Type, Float64Type, Int32Type, Int64Type, UInt64Type},
 };
+use arrow_cast::cast;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::{PrismError, Result};
@@ -96,6 +98,11 @@ pub fn hash_aggregate(batch: &RecordBatch, config: &HashAggConfig) -> Result<Rec
 /// This avoids the memory spike from `concat_batches` on large datasets by
 /// streaming rows from each batch into the same hash map accumulators.
 pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -> Result<RecordBatch> {
+    // Fast path: global aggregates (no GROUP BY) — use Arrow SIMD kernels
+    if config.group_by.is_empty() && !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0) {
+        return global_aggregate_batches(batches, config);
+    }
+
     if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
         let schema = if batches.is_empty() {
             // Fallback: build a schema from config field names
@@ -123,6 +130,23 @@ pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -
 
     for (batch_idx, batch) in batches.iter().enumerate() {
         let num_rows = batch.num_rows();
+        if num_rows == 0 { continue; }
+
+        // Pre-cast aggregate columns to Float64 for fast typed access
+        let agg_arrays: Vec<Float64Array> = config.aggregates.iter()
+            .map(|agg| {
+                let col = batch.column(agg.column);
+                if col.data_type() == &DataType::Float64 {
+                    col.as_primitive::<Float64Type>().clone()
+                } else {
+                    cast(col, &DataType::Float64)
+                        .expect("cast to f64")
+                        .as_primitive::<Float64Type>()
+                        .clone()
+                }
+            })
+            .collect();
+
         for row in 0..num_rows {
             let gh = hash_group_keys(batch, &config.group_by, row);
             let entry = groups.entry(gh).or_insert_with(|| {
@@ -133,8 +157,8 @@ pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -
                 (batch_idx, row, accums)
             });
 
-            for (agg_idx, agg) in config.aggregates.iter().enumerate() {
-                let value = get_numeric_value(batch.column(agg.column).as_ref(), row)?;
+            for (agg_idx, _agg) in config.aggregates.iter().enumerate() {
+                let value = agg_arrays[agg_idx].value(row);
                 entry.2[agg_idx].accumulate(value);
             }
         }
@@ -183,6 +207,113 @@ pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -
 
     let schema = SchemaRef::new(Schema::new(output_fields));
     Ok(RecordBatch::try_new(schema, output_columns)?)
+}
+
+/// Fast path for global aggregates (no GROUP BY) using Arrow SIMD compute kernels.
+///
+/// Instead of row-by-row accumulation through a hash map, this uses vectorized
+/// `sum()`, `min()`, `max()` kernels that process entire columns at once.
+fn global_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -> Result<RecordBatch> {
+    let mut output_fields: Vec<Arc<Field>> = Vec::new();
+    let mut output_columns: Vec<ArrayRef> = Vec::new();
+
+    for agg in &config.aggregates {
+        let output_type = match agg.func {
+            AggFunc::Count | AggFunc::CountDistinct => DataType::Int64,
+            _ => DataType::Float64,
+        };
+
+        let result_value: f64 = match agg.func {
+            AggFunc::Sum => {
+                let mut total = 0.0f64;
+                for batch in batches {
+                    if batch.num_rows() == 0 { continue; }
+                    let f64_col = cast_to_f64(batch.column(agg.column))?;
+                    if let Some(s) = arrow_agg::sum(f64_col.as_primitive::<Float64Type>()) {
+                        total += s;
+                    }
+                }
+                total
+            }
+            AggFunc::Count => {
+                let mut total = 0u64;
+                for batch in batches {
+                    let col = batch.column(agg.column);
+                    total += (col.len() - col.null_count()) as u64;
+                }
+                total as f64
+            }
+            AggFunc::Avg => {
+                let mut total_sum = 0.0f64;
+                let mut total_count = 0u64;
+                for batch in batches {
+                    if batch.num_rows() == 0 { continue; }
+                    let col = batch.column(agg.column);
+                    let f64_col = cast_to_f64(col)?;
+                    if let Some(s) = arrow_agg::sum(f64_col.as_primitive::<Float64Type>()) {
+                        total_sum += s;
+                    }
+                    total_count += (col.len() - col.null_count()) as u64;
+                }
+                if total_count > 0 { total_sum / total_count as f64 } else { 0.0 }
+            }
+            AggFunc::Min => {
+                let mut global_min = f64::INFINITY;
+                for batch in batches {
+                    if batch.num_rows() == 0 { continue; }
+                    let f64_col = cast_to_f64(batch.column(agg.column))?;
+                    if let Some(m) = arrow_agg::min(f64_col.as_primitive::<Float64Type>()) {
+                        if m < global_min { global_min = m; }
+                    }
+                }
+                if global_min == f64::INFINITY { 0.0 } else { global_min }
+            }
+            AggFunc::Max => {
+                let mut global_max = f64::NEG_INFINITY;
+                for batch in batches {
+                    if batch.num_rows() == 0 { continue; }
+                    let f64_col = cast_to_f64(batch.column(agg.column))?;
+                    if let Some(m) = arrow_agg::max(f64_col.as_primitive::<Float64Type>()) {
+                        if m > global_max { global_max = m; }
+                    }
+                }
+                if global_max == f64::NEG_INFINITY { 0.0 } else { global_max }
+            }
+            AggFunc::CountDistinct => {
+                let mut distinct: HashSet<u64> = HashSet::new();
+                for batch in batches {
+                    let f64_col = cast_to_f64(batch.column(agg.column))?;
+                    let arr = f64_col.as_primitive::<Float64Type>();
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            distinct.insert(arr.value(i).to_bits());
+                        }
+                    }
+                }
+                distinct.len() as f64
+            }
+        };
+
+        let array: ArrayRef = match output_type {
+            DataType::Int64 => Arc::new(Int64Array::from(vec![result_value as i64])),
+            _ => Arc::new(Float64Array::from(vec![result_value])),
+        };
+
+        output_fields.push(Arc::new(Field::new(&agg.output_name, output_type, true)));
+        output_columns.push(array);
+    }
+
+    let schema = SchemaRef::new(Schema::new(output_fields));
+    Ok(RecordBatch::try_new(schema, output_columns)?)
+}
+
+/// Cast an array to Float64 if it isn't already.
+fn cast_to_f64(array: &ArrayRef) -> Result<ArrayRef> {
+    if array.data_type() == &DataType::Float64 {
+        Ok(array.clone())
+    } else {
+        Ok(arrow_cast::cast(array, &DataType::Float64)?)
+    }
 }
 
 fn hash_group_keys(batch: &RecordBatch, key_cols: &[usize], row: usize) -> u64 {

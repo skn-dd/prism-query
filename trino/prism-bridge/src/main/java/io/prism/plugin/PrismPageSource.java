@@ -133,8 +133,33 @@ public class PrismPageSource implements ConnectorPageSource {
     private void executeOnAllWorkers() throws Exception {
         PrismPlanNode plan = tableHandle.getPushedPlan().orElseThrow();
         PrismPlanNode.Aggregate aggNode = findAggregateNode(plan).orElseThrow();
+        List<PrismPlanNode.AggregateExpr> originalAggs = aggNode.aggregates();
+        int groupByCount = aggNode.groupBy().size();
 
-        byte[] substraitBytes = SubstraitSerializer.serialize(plan);
+        // Expand AVG into SUM + COUNT for correct multi-worker merge
+        List<PrismPlanNode.AggregateExpr> workerAggs = new ArrayList<>();
+        // Maps original agg index -> [workerAgg indices]. For AVG, maps to [sumIdx, countIdx].
+        List<int[]> aggMapping = new ArrayList<>();
+
+        for (int i = 0; i < originalAggs.size(); i++) {
+            PrismPlanNode.AggregateExpr agg = originalAggs.get(i);
+            if ("AVG".equals(agg.function())) {
+                int sumIdx = workerAggs.size();
+                workerAggs.add(new PrismPlanNode.AggregateExpr("SUM", agg.columnIndex(), "agg_" + workerAggs.size()));
+                int countIdx = workerAggs.size();
+                workerAggs.add(new PrismPlanNode.AggregateExpr("COUNT", agg.columnIndex(), "agg_" + workerAggs.size()));
+                aggMapping.add(new int[]{sumIdx, countIdx});
+            } else {
+                int idx = workerAggs.size();
+                workerAggs.add(new PrismPlanNode.AggregateExpr(agg.function(), agg.columnIndex(), "agg_" + workerAggs.size()));
+                aggMapping.add(new int[]{idx});
+            }
+        }
+
+        // Build modified plan with expanded aggregates for workers
+        PrismPlanNode workerPlan = replaceAggregates(plan, aggNode, workerAggs);
+
+        byte[] substraitBytes = SubstraitSerializer.serialize(workerPlan);
         String planB64 = Base64.getEncoder().encodeToString(substraitBytes);
 
         int workerCount = executor.workerCount();
@@ -165,14 +190,9 @@ public class PrismPageSource implements ConnectorPageSource {
         }
         CompletableFuture.allOf(futures).join();
 
-        // Fetch and merge results from all workers
-        int groupByCount = aggNode.groupBy().size();
-        List<PrismPlanNode.AggregateExpr> aggs = aggNode.aggregates();
-        int aggCount = aggs.size();
-
-        // group key → [agg accumulators], merge counts for AVG
+        // Merge using EXPANDED aggregates
+        int workerAggCount = workerAggs.size();
         Map<List<Object>, double[]> merged = new LinkedHashMap<>();
-        Map<List<Object>, int[]> avgCounts = new LinkedHashMap<>();
 
         for (int wi = 0; wi < workerCount; wi++) {
             try (FlightStream stream = executor.fetchResultStream(wi, resultKeys[wi])) {
@@ -185,22 +205,20 @@ public class PrismPageSource implements ConnectorPageSource {
                         }
 
                         double[] accums = merged.computeIfAbsent(groupKey, k -> {
-                            double[] a = new double[aggCount];
-                            for (int ai = 0; ai < aggCount; ai++) {
-                                if ("MIN".equals(aggs.get(ai).function())) a[ai] = Double.MAX_VALUE;
-                                if ("MAX".equals(aggs.get(ai).function())) a[ai] = -Double.MAX_VALUE;
+                            double[] a = new double[workerAggCount];
+                            for (int ai = 0; ai < workerAggCount; ai++) {
+                                if ("MIN".equals(workerAggs.get(ai).function())) a[ai] = Double.MAX_VALUE;
+                                if ("MAX".equals(workerAggs.get(ai).function())) a[ai] = -Double.MAX_VALUE;
                             }
                             return a;
                         });
-                        int[] cnts = avgCounts.computeIfAbsent(groupKey, k -> new int[aggCount]);
 
-                        for (int ai = 0; ai < aggCount; ai++) {
+                        for (int ai = 0; ai < workerAggCount; ai++) {
                             double val = extractDouble(workerRoot.getVector(groupByCount + ai), row);
-                            switch (aggs.get(ai).function()) {
+                            switch (workerAggs.get(ai).function()) {
                                 case "SUM", "COUNT", "COUNT_DISTINCT" -> accums[ai] += val;
                                 case "MIN" -> accums[ai] = Math.min(accums[ai], val);
                                 case "MAX" -> accums[ai] = Math.max(accums[ai], val);
-                                case "AVG" -> { accums[ai] += val; cnts[ai]++; }
                             }
                         }
                     }
@@ -208,19 +226,37 @@ public class PrismPageSource implements ConnectorPageSource {
             }
         }
 
-        // Finalize AVG: simple average of averages (valid for equal-size partitions)
+        // Reconstruct original aggregate results from expanded results
+        Map<List<Object>, double[]> finalResults = new LinkedHashMap<>();
         for (var entry : merged.entrySet()) {
-            double[] accums = entry.getValue();
-            int[] cnts = avgCounts.get(entry.getKey());
-            for (int ai = 0; ai < aggCount; ai++) {
-                if ("AVG".equals(aggs.get(ai).function()) && cnts[ai] > 0) {
-                    accums[ai] /= cnts[ai];
+            double[] workerAccums = entry.getValue();
+            double[] finalAccums = new double[originalAggs.size()];
+            for (int i = 0; i < originalAggs.size(); i++) {
+                int[] mapping = aggMapping.get(i);
+                if ("AVG".equals(originalAggs.get(i).function())) {
+                    // AVG = SUM / COUNT
+                    double sum = workerAccums[mapping[0]];
+                    double count = workerAccums[mapping[1]];
+                    finalAccums[i] = count > 0 ? sum / count : 0.0;
+                } else {
+                    finalAccums[i] = workerAccums[mapping[0]];
                 }
             }
+            finalResults.put(entry.getKey(), finalAccums);
         }
 
         // Build a Trino Page from merged results
-        mergedPage = buildMergedPage(merged, groupByCount, aggs);
+        mergedPage = buildMergedPage(finalResults, groupByCount, originalAggs);
+    }
+
+    private PrismPlanNode replaceAggregates(PrismPlanNode plan, PrismPlanNode.Aggregate originalAgg, List<PrismPlanNode.AggregateExpr> newAggs) {
+        if (plan instanceof PrismPlanNode.Aggregate) {
+            return new PrismPlanNode.Aggregate(originalAgg.input(), originalAgg.groupBy(), newAggs);
+        }
+        if (plan instanceof PrismPlanNode.Sort sort) {
+            return new PrismPlanNode.Sort(replaceAggregates(sort.input(), originalAgg, newAggs), sort.sortKeys(), sort.limit());
+        }
+        return plan;
     }
 
     private Page buildMergedPage(Map<List<Object>, double[]> merged,

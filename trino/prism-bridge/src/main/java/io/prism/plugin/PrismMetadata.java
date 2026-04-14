@@ -1,6 +1,8 @@
 package io.prism.plugin;
 
 import io.trino.spi.connector.*;
+import io.trino.spi.connector.SortItem;
+import io.trino.spi.connector.TopNApplicationResult;
 import io.trino.spi.expression.Call;
 import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.expression.Constant;
@@ -488,10 +490,67 @@ public class PrismMetadata implements ConnectorMetadata {
         };
     }
 
+    // ===== TopN Pushdown =====
+
+    @Override
+    public Optional<TopNApplicationResult<ConnectorTableHandle>> applyTopN(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            long topNCount,
+            List<SortItem> sortItems,
+            Map<String, ColumnHandle> assignments) {
+        PrismTableHandle handle = (PrismTableHandle) table;
+
+        if (topNCount <= 0 || topNCount > Integer.MAX_VALUE || sortItems.isEmpty()) {
+            return Optional.empty();
+        }
+
+        List<PrismPlanNode.SortKeyDef> sortKeys = new ArrayList<>();
+        for (SortItem item : sortItems) {
+            String colName = item.getName();
+            ColumnHandle ch = assignments.get(colName);
+            if (!(ch instanceof PrismColumnHandle col)) {
+                return Optional.empty();
+            }
+            String direction = item.getSortOrder().isAscending() ? "ASC" : "DESC";
+            String nullOrdering = item.getSortOrder().isNullsFirst() ? "NULLS_FIRST" : "NULLS_LAST";
+            sortKeys.add(new PrismPlanNode.SortKeyDef(col.getColumnIndex(), direction, nullOrdering));
+        }
+
+        PrismPlanNode currentPlan = handle.getPushedPlan()
+                .orElseGet(() -> buildFullScan(handle.getTableName()));
+        PrismPlanNode sortPlan = new PrismPlanNode.Sort(currentPlan, sortKeys, topNCount);
+        PrismTableHandle newHandle = handle.withPushedPlan(sortPlan);
+
+        return Optional.of(new TopNApplicationResult<>(newHandle, true, false));
+    }
+
     // ===== Expression Conversion =====
 
     private PrismPlanNode.ScalarExprNode convertCallExpression(Call call, Map<String, ColumnHandle> assignments) {
         String funcName = call.getFunctionName().getName();
+
+        // Handle CAST: unwrap and process the inner expression.
+        // Rust evaluates all arithmetic as Float64, so explicit casts are no-ops.
+        if ("$cast".equals(funcName)) {
+            if (call.getArguments().isEmpty()) return null;
+            ConnectorExpression inner = call.getArguments().get(0);
+            if (inner instanceof Variable var) {
+                ColumnHandle ch = assignments.get(var.getName());
+                if (ch instanceof PrismColumnHandle pch) {
+                    return new PrismPlanNode.ScalarExprNode.ColumnRef(pch.getColumnIndex());
+                }
+                return null;
+            } else if (inner instanceof Call innerCall) {
+                return convertCallExpression(innerCall, assignments);
+            } else if (inner instanceof Constant constant) {
+                Object value = convertTrinoValue(constant.getType(), constant.getValue());
+                String valueType = typeToValueType(constant.getType());
+                return new PrismPlanNode.ScalarExprNode.Literal(value, valueType);
+            }
+            return null;
+        }
+
         String op = switch (funcName) {
             case "$add" -> "ADD";
             case "$subtract" -> "SUBTRACT";

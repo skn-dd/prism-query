@@ -18,7 +18,7 @@ use substrait::proto::{
         ScalarFunction,
     },
     sort_field::{SortDirection as SubstraitSortDirection, SortKind},
-    AggregateRel, Expression, FilterRel, JoinRel, ProjectRel, ReadRel, SortRel,
+    AggregateRel, Expression, FetchRel, FilterRel, JoinRel, ProjectRel, ReadRel, SortRel,
 };
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -69,6 +69,7 @@ fn consume_rel(rel: &Rel) -> Result<PlanNode> {
         Some(RelType::Aggregate(aggregate)) => consume_aggregate(aggregate),
         Some(RelType::Join(join)) => consume_join(join),
         Some(RelType::Sort(sort)) => consume_sort(sort),
+        Some(RelType::Fetch(fetch)) => consume_fetch(fetch),
         Some(other) => Err(SubstraitError::UnsupportedRelation(format!("{:?}", other))),
         None => Err(SubstraitError::MissingField("rel.rel_type".into())),
     }
@@ -278,6 +279,47 @@ fn consume_sort(sort: &SortRel) -> Result<PlanNode> {
         sort_keys,
         limit: None,
     })
+}
+
+fn consume_fetch(fetch: &FetchRel) -> Result<PlanNode> {
+    let input = fetch
+        .input
+        .as_ref()
+        .ok_or_else(|| SubstraitError::MissingField("fetch.input".into()))?;
+    let input_node = consume_rel(input)?;
+
+    // Extract the count (limit) from the oneof CountMode
+    let limit = match &fetch.count_mode {
+        Some(substrait::proto::fetch_rel::CountMode::Count(c)) if *c >= 0 => {
+            Some(*c as usize)
+        }
+        _ => None, // unset or -1 means ALL records
+    };
+
+    // offset_mode is recognized but not yet supported in execution
+    let _offset = match &fetch.offset_mode {
+        Some(substrait::proto::fetch_rel::OffsetMode::Offset(o)) => *o,
+        _ => 0,
+    };
+
+    // If the input is a Sort node, fold the limit into it (TopN optimization)
+    match input_node {
+        PlanNode::Sort { input, sort_keys, limit: _ } => {
+            Ok(PlanNode::Sort {
+                input,
+                sort_keys,
+                limit,
+            })
+        }
+        // For non-sort inputs, wrap in a Sort with empty keys (acts as pure LIMIT)
+        other => {
+            Ok(PlanNode::Sort {
+                input: Box::new(other),
+                sort_keys: vec![],
+                limit,
+            })
+        }
+    }
 }
 
 // --- Helper functions ---

@@ -1,0 +1,110 @@
+{
+  "databricks_sf1_scan": {
+    "ms": 419.91,
+    "rows": 1
+  },
+  "databricks_sf1_filter": {
+    "ms": 540.17,
+    "rows": 1
+  },
+  "databricks_sf1_agg": {
+    "ms": 582.75,
+    "rows": 3
+  },
+  "databricks_sf1_q1": {
+    "ms": 760.55,
+    "rows": 4
+  },
+  "databricks_sf1_q6": {
+    "ms": 509.77,
+    "rows": 1
+  },
+  "databricks_sf1_orders_agg": {
+    "ms": 443.81,
+    "rows": 3
+  },
+  "databricks_sf1_multi_agg": {
+    "ms": 609.76,
+    "rows": 4
+  },
+  "databricks_sf1_topn": {
+    "ms": 474.62,
+    "rows": 10
+  },
+  "databricks_sf1_join": {
+    "ms": 972.58,
+    "rows": 3
+  },
+  "databricks_sf10_scan": {
+    "ms": 379.05,
+    "rows": 1
+  },
+  "databricks_sf10_filter": {
+    "ms": 553.98,
+    "rows": 1
+  },
+  "databricks_sf10_agg": {
+    "ms": 898.94,
+    "rows": 3
+  },
+  "databricks_sf10_q1": {
+    "ms": 1593.37,
+    "rows": 4
+  },
+  "databricks_sf10_q6": {
+    "ms": 760.73,
+    "rows": 1
+  },
+  "databricks_sf10_orders_agg": {
+    "ms": 481.78,
+    "rows": 3
+  },
+  "databricks_sf10_multi_agg": {
+    "ms": 989.54,
+    "rows": 4
+  },
+  "databricks_sf10_topn": {
+    "ms": 1475.64,
+    "rows": 10
+  },
+  "databricks_sf10_join": {
+    "ms": 3336.62,
+    "rows": 3
+  },
+  "databricks_sf100_scan": {
+    "ms": 485.05,
+    "rows": 1
+  },
+  "databricks_sf100_filter": {
+    "ms": 915.75,
+    "rows": 1
+  },
+  "databricks_sf100_agg": {
+    "ms": 3872.62,
+    "rows": 3
+  },
+  "databricks_sf100_q1": {
+    "ms": 10812.27,
+    "rows": 4
+  },
+  "databricks_sf100_q6": {
+    "ms": 2970.59,
+    "rows": 1
+  },
+  "databricks_sf100_orders_agg": {
+    "ms": 1221.97,
+    "rows": 3
+  },
+  "databricks_sf100_multi_agg": {
+    "ms": 5713.21,
+    "rows": 4
+  },
+  "databricks_sf100_topn": {
+    "ms": 4874.66,
+    "rows": 10
+  },
+  "databricks_sf100_join": {
+    "ms": 13692.81,
+    "rows": 3
+  }
+}
