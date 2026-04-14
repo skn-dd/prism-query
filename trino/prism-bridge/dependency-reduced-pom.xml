@@ -36,7 +36,6 @@
                 <excludes>
                   <exclude>io.trino:trino-spi</exclude>
                   <exclude>io.airlift:slice</exclude>
-                  <exclude>com.fasterxml.jackson.core:jackson-annotations</exclude>
                 </excludes>
               </artifactSet>
               <filters>

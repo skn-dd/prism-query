@@ -16,13 +16,28 @@ use prism_executor::sort;
 use crate::plan::PlanNode;
 use crate::{Result, SubstraitError};
 
-/// Execute a PlanNode tree against a table registry.
+/// Execute a PlanNode tree against a table registry (single RecordBatch per table).
 ///
-/// The `tables` map provides the data for Scan nodes: table_name → RecordBatch.
-/// This is the main entry point for both JNI and Flight-based execution.
+/// Convenience wrapper — converts to chunked format and delegates to `execute_plan_chunked`.
 pub fn execute_plan(
     node: &PlanNode,
     tables: &HashMap<String, RecordBatch>,
+) -> Result<RecordBatch> {
+    let chunked: HashMap<String, Vec<RecordBatch>> = tables
+        .iter()
+        .map(|(k, v)| (k.clone(), vec![v.clone()]))
+        .collect();
+    execute_plan_chunked(node, &chunked)
+}
+
+/// Execute a PlanNode tree against a chunked table registry.
+///
+/// Each table maps to a `Vec<RecordBatch>` (chunks). This avoids materializing
+/// all chunks into a single giant RecordBatch, which is critical for SF100+
+/// where a single lineitem table can be 40+ GB.
+pub fn execute_plan_chunked(
+    node: &PlanNode,
+    tables: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<RecordBatch> {
     let batches = execute_node(node, tables)?;
     if batches.is_empty() {
@@ -37,19 +52,21 @@ pub fn execute_plan(
 
 fn execute_node(
     node: &PlanNode,
-    tables: &HashMap<String, RecordBatch>,
+    tables: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<Vec<RecordBatch>> {
     match node {
         PlanNode::Scan { table_name, projection, .. } => {
-            let batch = tables.get(table_name).ok_or_else(|| {
+            let batches = tables.get(table_name).ok_or_else(|| {
                 SubstraitError::Internal(format!("table '{}' not found in registry", table_name))
             })?;
-            // Apply projection if specified
             if let Some(proj_cols) = projection {
-                let projected = filter_project::project_batch(batch, proj_cols)?;
-                Ok(vec![projected])
+                let mut output = Vec::with_capacity(batches.len());
+                for batch in batches {
+                    output.push(filter_project::project_batch(batch, proj_cols)?);
+                }
+                Ok(output)
             } else {
-                Ok(vec![batch.clone()])
+                Ok(batches.clone())
             }
         }
 
@@ -58,7 +75,10 @@ fn execute_node(
             let mut output = Vec::new();
             for batch in &child_batches {
                 let mask = filter_project::evaluate_predicate(batch, predicate)?;
-                output.push(filter_project::filter_batch(batch, &mask)?);
+                let filtered = filter_project::filter_batch(batch, &mask)?;
+                if filtered.num_rows() > 0 {
+                    output.push(filtered);
+                }
             }
             Ok(output)
         }
@@ -85,13 +105,13 @@ fn execute_node(
             if child_batches.is_empty() {
                 return Ok(vec![]);
             }
-            let merged = concat_batches(&child_batches[0].schema(), &child_batches)?;
 
             let config = hash_aggregate::HashAggConfig {
                 group_by: group_by.clone(),
                 aggregates: aggregates.clone(),
             };
-            let result = hash_aggregate::hash_aggregate(&merged, &config)?;
+            // Use chunked aggregation — processes batches without concatenating
+            let result = hash_aggregate::hash_aggregate_batches(&child_batches, &config)?;
             Ok(vec![result])
         }
 

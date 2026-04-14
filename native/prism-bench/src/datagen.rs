@@ -17,52 +17,60 @@ pub fn make_lineitem(sf: f64) -> RecordBatch {
 /// Each chunk has at most `chunk_size` rows (default 5M for SF100 compatibility).
 pub fn make_lineitem_chunked(sf: f64, chunk_size: usize) -> Vec<RecordBatch> {
     let n = (6_000_000.0 * sf) as usize;
+    make_lineitem_shard(n, 0, chunk_size)
+}
+
+/// Generate a shard of TPC-H lineitem table.
+/// `row_count` rows starting from global `row_offset`, in chunks of `chunk_size`.
+pub fn make_lineitem_shard(row_count: usize, row_offset: usize, chunk_size: usize) -> Vec<RecordBatch> {
     let schema = lineitem_schema();
     let flags = ["A", "N", "R"];
     let statuses = ["F", "O"];
 
     let mut batches = Vec::new();
-    let mut offset = 0usize;
-    while offset < n {
-        let end = (offset + chunk_size).min(n);
+    let mut local = 0usize;
+    while local < row_count {
+        let chunk_end = (local + chunk_size).min(row_count);
+        let g_start = row_offset + local;
+        let g_end = row_offset + chunk_end;
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int64Array::from((offset..end).map(|i| i as i64).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from((g_start..g_end).map(|i| i as i64).collect::<Vec<_>>())),
                 Arc::new(Int64Array::from(
-                    (offset..end).map(|i| (i % 200_000) as i64).collect::<Vec<_>>(),
+                    (g_start..g_end).map(|i| (i % 200_000) as i64).collect::<Vec<_>>(),
                 )),
                 Arc::new(Int64Array::from(
-                    (offset..end).map(|i| (i % 10_000) as i64).collect::<Vec<_>>(),
+                    (g_start..g_end).map(|i| (i % 10_000) as i64).collect::<Vec<_>>(),
                 )),
                 Arc::new(Int32Array::from(
-                    (offset..end).map(|i| (i % 7 + 1) as i32).collect::<Vec<_>>(),
+                    (g_start..g_end).map(|i| (i % 7 + 1) as i32).collect::<Vec<_>>(),
                 )),
                 Arc::new(Float64Array::from(
-                    (offset..end).map(|i| (i % 50 + 1) as f64).collect::<Vec<_>>(),
+                    (g_start..g_end).map(|i| (i % 50 + 1) as f64).collect::<Vec<_>>(),
                 )),
                 Arc::new(Float64Array::from(
-                    (offset..end)
+                    (g_start..g_end)
                         .map(|i| ((i % 100_000) as f64) * 0.99 + 900.0)
                         .collect::<Vec<_>>(),
                 )),
                 Arc::new(Float64Array::from(
-                    (offset..end).map(|i| (i % 11) as f64 * 0.01).collect::<Vec<_>>(),
+                    (g_start..g_end).map(|i| (i % 11) as f64 * 0.01).collect::<Vec<_>>(),
                 )),
                 Arc::new(Float64Array::from(
-                    (offset..end).map(|i| (i % 9) as f64 * 0.01).collect::<Vec<_>>(),
+                    (g_start..g_end).map(|i| (i % 9) as f64 * 0.01).collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from(
-                    (offset..end).map(|i| flags[i % 3]).collect::<Vec<_>>(),
+                    (g_start..g_end).map(|i| flags[i % 3]).collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from(
-                    (offset..end).map(|i| statuses[i % 2]).collect::<Vec<_>>(),
+                    (g_start..g_end).map(|i| statuses[i % 2]).collect::<Vec<_>>(),
                 )),
             ],
         )
         .unwrap();
         batches.push(batch);
-        offset = end;
+        local = chunk_end;
     }
     batches
 }
@@ -93,37 +101,45 @@ pub fn make_orders(sf: f64) -> RecordBatch {
 /// Generate TPC-H orders table as chunked RecordBatches.
 pub fn make_orders_chunked(sf: f64, chunk_size: usize) -> Vec<RecordBatch> {
     let n = (1_500_000.0 * sf) as usize;
+    make_orders_shard(n, 0, chunk_size)
+}
+
+/// Generate a shard of TPC-H orders table.
+/// `row_count` rows starting from global `row_offset`, in chunks of `chunk_size`.
+pub fn make_orders_shard(row_count: usize, row_offset: usize, chunk_size: usize) -> Vec<RecordBatch> {
     let schema = orders_schema();
     let statuses = ["F", "O", "P"];
     let priorities = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
 
     let mut batches = Vec::new();
-    let mut offset = 0usize;
-    while offset < n {
-        let end = (offset + chunk_size).min(n);
+    let mut local = 0usize;
+    while local < row_count {
+        let chunk_end = (local + chunk_size).min(row_count);
+        let g_start = row_offset + local;
+        let g_end = row_offset + chunk_end;
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int64Array::from((offset..end).map(|i| i as i64).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from((g_start..g_end).map(|i| i as i64).collect::<Vec<_>>())),
                 Arc::new(Int64Array::from(
-                    (offset..end).map(|i| (i % 150_000) as i64).collect::<Vec<_>>(),
+                    (g_start..g_end).map(|i| (i % 150_000) as i64).collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from(
-                    (offset..end).map(|i| statuses[i % 3]).collect::<Vec<_>>(),
+                    (g_start..g_end).map(|i| statuses[i % 3]).collect::<Vec<_>>(),
                 )),
                 Arc::new(Float64Array::from(
-                    (offset..end)
+                    (g_start..g_end)
                         .map(|i| (i as f64) * 2.5 + 100.0)
                         .collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from(
-                    (offset..end).map(|i| priorities[i % 5]).collect::<Vec<_>>(),
+                    (g_start..g_end).map(|i| priorities[i % 5]).collect::<Vec<_>>(),
                 )),
             ],
         )
         .unwrap();
         batches.push(batch);
-        offset = end;
+        local = chunk_end;
     }
     batches
 }

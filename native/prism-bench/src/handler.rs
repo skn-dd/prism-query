@@ -33,19 +33,21 @@ impl ActionHandler for QueryHandler {
                 .decode(plan_b64)
                 .map_err(|e| anyhow::anyhow!("base64 decode error: {}", e))?;
 
-            // Load tables from the store
-            let tables = load_tables(&command, store).await?;
+            // Load tables from the store (chunked — no concat)
+            let tables = load_tables_chunked(&command, store).await?;
 
             let start = Instant::now();
             let plan = prism_substrait::consumer::consume_plan(&plan_bytes)
                 .map_err(|e| anyhow::anyhow!("Substrait consume error: {}", e))?;
-            let result = prism_substrait::executor::execute_plan(&plan.root, &tables)
+            let result = prism_substrait::executor::execute_plan_chunked(&plan.root, &tables)
                 .map_err(|e| anyhow::anyhow!("Substrait execute error: {}", e))?;
             let elapsed = start.elapsed();
 
+            let total_rows: usize = tables.values().map(|bs| bs.iter().map(|b| b.num_rows()).sum::<usize>()).sum();
             tracing::info!(
-                "Executed Substrait plan on {} tables → {} rows in {:.2}ms",
+                "Executed Substrait plan on {} tables ({} total rows) → {} rows in {:.2}ms",
                 tables.len(),
+                total_rows,
                 result.num_rows(),
                 elapsed.as_secs_f64() * 1000.0,
             );
@@ -63,11 +65,19 @@ impl ActionHandler for QueryHandler {
             let store_key = command["store_key"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("datagen: missing 'store_key' field"))?;
             let chunk_size = command["chunk_size"].as_u64().unwrap_or(5_000_000) as usize;
+            let row_offset = command["row_offset"].as_u64().unwrap_or(0) as usize;
+            let row_count = command["row_count"].as_u64().map(|v| v as usize);
 
             let start = Instant::now();
             let batches = match table {
-                "lineitem" => datagen::make_lineitem_chunked(sf, chunk_size),
-                "orders" => datagen::make_orders_chunked(sf, chunk_size),
+                "lineitem" => {
+                    let n = row_count.unwrap_or((6_000_000.0 * sf) as usize);
+                    datagen::make_lineitem_shard(n, row_offset, chunk_size)
+                }
+                "orders" => {
+                    let n = row_count.unwrap_or((1_500_000.0 * sf) as usize);
+                    datagen::make_orders_shard(n, row_offset, chunk_size)
+                }
                 other => return Err(anyhow::anyhow!("datagen: unknown table '{}'", other)),
             };
             let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -125,7 +135,30 @@ impl ActionHandler for QueryHandler {
     }
 }
 
-/// Load tables from the partition store based on the "tables" map in the command JSON.
+/// Load tables from the partition store as chunked batches (no concat).
+/// Used by the Substrait executor path which handles chunked data natively.
+async fn load_tables_chunked(
+    command: &serde_json::Value,
+    store: &PartitionStore,
+) -> anyhow::Result<HashMap<String, Vec<RecordBatch>>> {
+    let tables_map = command["tables"].as_object()
+        .ok_or_else(|| anyhow::anyhow!("missing 'tables' field"))?;
+
+    let mut tables: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    for (name, key_val) in tables_map {
+        let key = key_val.as_str()
+            .ok_or_else(|| anyhow::anyhow!("table key must be a string"))?;
+        let batches = store.get(key).await;
+        if batches.is_empty() {
+            return Err(anyhow::anyhow!("table '{}' (key '{}') not found in store", name, key));
+        }
+        tables.insert(name.clone(), batches);
+    }
+    Ok(tables)
+}
+
+/// Load tables from the partition store, concatenating all chunks into single RecordBatches.
+/// Used by the legacy hardcoded query path which expects single RecordBatch per table.
 async fn load_tables(
     command: &serde_json::Value,
     store: &PartitionStore,

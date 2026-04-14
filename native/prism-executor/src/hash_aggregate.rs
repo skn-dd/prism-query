@@ -88,28 +88,55 @@ impl GroupAccumulator {
 
 /// Execute hash aggregation on a RecordBatch.
 pub fn hash_aggregate(batch: &RecordBatch, config: &HashAggConfig) -> Result<RecordBatch> {
-    let num_rows = batch.num_rows();
-    if num_rows == 0 {
-        return build_empty_result(batch.schema(), config);
+    hash_aggregate_batches(&[batch.clone()], config)
+}
+
+/// Execute hash aggregation across multiple RecordBatches without concatenating them.
+///
+/// This avoids the memory spike from `concat_batches` on large datasets by
+/// streaming rows from each batch into the same hash map accumulators.
+pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -> Result<RecordBatch> {
+    if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+        let schema = if batches.is_empty() {
+            // Fallback: build a schema from config field names
+            let mut fields: Vec<Arc<Field>> = Vec::new();
+            for agg in &config.aggregates {
+                let dt = match agg.func {
+                    AggFunc::Count | AggFunc::CountDistinct => DataType::Int64,
+                    _ => DataType::Float64,
+                };
+                fields.push(Arc::new(Field::new(&agg.output_name, dt, true)));
+            }
+            SchemaRef::new(Schema::new(fields))
+        } else {
+            batches[0].schema()
+        };
+        return build_empty_result(schema, config);
     }
 
-    // Map group hash → (first_row_index, per-agg accumulators)
-    let mut groups: HashMap<u64, (usize, Vec<GroupAccumulator>)> = HashMap::new();
+    // We need a reference batch for group-key extraction (take from first non-empty)
+    let ref_batch = batches.iter().find(|b| b.num_rows() > 0).unwrap();
+
+    // Map group hash → (batch_index, first_row_index, per-agg accumulators)
+    let mut groups: HashMap<u64, (usize, usize, Vec<GroupAccumulator>)> = HashMap::new();
     let mut group_order: Vec<u64> = Vec::new();
 
-    for row in 0..num_rows {
-        let gh = hash_group_keys(batch, &config.group_by, row);
-        let entry = groups.entry(gh).or_insert_with(|| {
-            group_order.push(gh);
-            let accums = config.aggregates.iter()
-                .map(|agg| GroupAccumulator::new(agg.func == AggFunc::CountDistinct))
-                .collect();
-            (row, accums)
-        });
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        let num_rows = batch.num_rows();
+        for row in 0..num_rows {
+            let gh = hash_group_keys(batch, &config.group_by, row);
+            let entry = groups.entry(gh).or_insert_with(|| {
+                group_order.push(gh);
+                let accums = config.aggregates.iter()
+                    .map(|agg| GroupAccumulator::new(agg.func == AggFunc::CountDistinct))
+                    .collect();
+                (batch_idx, row, accums)
+            });
 
-        for (agg_idx, agg) in config.aggregates.iter().enumerate() {
-            let value = get_numeric_value(batch.column(agg.column).as_ref(), row)?;
-            entry.1[agg_idx].accumulate(value);
+            for (agg_idx, agg) in config.aggregates.iter().enumerate() {
+                let value = get_numeric_value(batch.column(agg.column).as_ref(), row)?;
+                entry.2[agg_idx].accumulate(value);
+            }
         }
     }
 
@@ -117,23 +144,25 @@ pub fn hash_aggregate(batch: &RecordBatch, config: &HashAggConfig) -> Result<Rec
     let mut output_columns: Vec<ArrayRef> = Vec::new();
     let mut output_fields: Vec<Arc<Field>> = Vec::new();
 
-    // Group-by columns
+    // Group-by columns — take from the batch where the group was first seen
     for &col_idx in &config.group_by {
-        let field = batch.schema().field(col_idx).clone();
-        let source_col = batch.column(col_idx);
-        let take_indices: Vec<u32> = group_order.iter()
-            .map(|gh| groups[gh].0 as u32)
-            .collect();
-        let indices = arrow_array::UInt32Array::from(take_indices);
-        let taken = arrow::compute::take(source_col, &indices, None)?;
+        let field = ref_batch.schema().field(col_idx).clone();
+        let mut values: Vec<ArrayRef> = Vec::new();
+        for &gh in &group_order {
+            let (bi, ri, _) = &groups[&gh];
+            let source_col = batches[*bi].column(col_idx);
+            values.push(source_col.slice(*ri, 1));
+        }
+        let refs: Vec<&dyn Array> = values.iter().map(|a| a.as_ref()).collect();
+        let concatenated = arrow::compute::concat(&refs)?;
         output_fields.push(Arc::new(field));
-        output_columns.push(taken);
+        output_columns.push(concatenated);
     }
 
     // Aggregate result columns
     for (agg_idx, agg) in config.aggregates.iter().enumerate() {
         let values: Vec<f64> = group_order.iter()
-            .map(|gh| groups[gh].1[agg_idx].result(agg.func))
+            .map(|gh| groups[gh].2[agg_idx].result(agg.func))
             .collect();
 
         let output_type = match agg.func {
