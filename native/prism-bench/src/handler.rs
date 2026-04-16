@@ -10,9 +10,9 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use base64::Engine;
 
-use prism_executor::parquet_scan::{ParquetScanConfig, parquet_scan};
+use prism_executor::parquet_scan::{ParquetScanConfig, parquet_scan, parquet_row_count};
 use prism_flight::shuffle_writer::{ActionHandler, PartitionStore};
-use prism_substrait::plan_opt::{ScanHint, extract_scan_hints};
+use prism_substrait::plan_opt::{ScanHint, extract_scan_hints, extract_projection_hints, detect_count_star};
 
 use crate::{datagen, queries};
 
@@ -53,13 +53,58 @@ impl ActionHandler for QueryHandler {
             let plan = prism_substrait::consumer::consume_plan(&plan_bytes)
                 .map_err(|e| anyhow::anyhow!("Substrait consume error: {}", e))?;
 
-            // Extract scan hints for Parquet row group skipping
-            let hints = extract_scan_hints(&plan.root);
+            // Extract scan hints for Parquet row group skipping + column pruning
+            let mut hints = extract_scan_hints(&plan.root);
+            extract_projection_hints(&plan.root, &mut hints);
+
+            // Fast path: COUNT(*) from Parquet metadata only (no data reading)
+            if let Some(data_dir) = self.data_dir.as_deref() {
+                if let Some((table_name, pred)) = detect_count_star(&plan.root) {
+                    if let Some(store_key) = command["tables"]
+                        .as_object()
+                        .and_then(|m| m.get(&table_name))
+                        .and_then(|v| v.as_str())
+                    {
+                        let parquet_dir = data_dir.join(store_key);
+                        if parquet_dir.exists() {
+                            let count = parquet_row_count(
+                                &parquet_dir,
+                                pred.as_ref(),
+                            ).map_err(|e| anyhow::anyhow!("Parquet row count error: {}", e))?;
+
+                            tracing::info!(
+                                "COUNT(*) metadata shortcut for '{}': {} rows in {:.2}ms",
+                                table_name,
+                                count,
+                                start.elapsed().as_secs_f64() * 1000.0,
+                            );
+
+                            let schema = Arc::new(Schema::new(vec![
+                                Field::new(&plan.root.aggregate_output_name().unwrap_or("cnt".into()),
+                                           DataType::Int64, true),
+                            ]));
+                            return Ok(RecordBatch::try_new(
+                                schema,
+                                vec![Arc::new(Int64Array::from(vec![count as i64]))],
+                            )?);
+                        }
+                    }
+                }
+            }
 
             // Load tables — Parquet with pushdown if available, else in-memory
-            let tables = load_tables_smart(&command, store, self.data_dir.as_deref(), &hints).await?;
+            let (tables, col_remaps) = load_tables_smart(&command, store, self.data_dir.as_deref(), &hints).await?;
 
-            let result = prism_substrait::executor::execute_plan_chunked(&plan.root, &tables)
+            // Remap column indices if we used skip_expand for projected Parquet loading.
+            // Only safe for single-table queries (avoid misremapping JOIN columns).
+            let mut plan_root = plan.root.clone();
+            if col_remaps.len() == 1 {
+                for (_table_name, remap) in &col_remaps {
+                    remap_plan_for_table(&mut plan_root, _table_name, remap);
+                }
+            }
+
+            let result = prism_substrait::executor::execute_plan_chunked(&plan_root, &tables)
                 .map_err(|e| anyhow::anyhow!("Substrait execute error: {}", e))?;
             let elapsed = start.elapsed();
 
@@ -74,6 +119,15 @@ impl ActionHandler for QueryHandler {
                 result.num_rows(),
                 elapsed.as_secs_f64() * 1000.0,
             );
+
+            // Explicitly drop loaded tables to free Arrow buffers, then
+            // ask glibc to return freed pages to the OS. Without this,
+            // the allocator holds onto pages across queries, causing OOM
+            // at large scale factors.
+            drop(tables);
+            #[cfg(target_os = "linux")]
+            unsafe { libc::malloc_trim(0); }
+
             return Ok(result);
         }
 
@@ -240,17 +294,24 @@ impl QueryHandler {
 
 /// Load tables with Parquet support. Checks for Parquet files first,
 /// falls back to PartitionStore.
+/// Returns the tables AND column remap mappings (orig_col_idx -> projected_col_idx)
+/// for each table that was loaded with projection + skip_expand.
 async fn load_tables_smart(
     command: &serde_json::Value,
     store: &PartitionStore,
     data_dir: Option<&Path>,
     hints: &HashMap<String, ScanHint>,
-) -> anyhow::Result<HashMap<String, Vec<RecordBatch>>> {
+) -> anyhow::Result<(HashMap<String, Vec<RecordBatch>>, HashMap<String, HashMap<usize, usize>>)> {
     let tables_map = command["tables"]
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("missing 'tables' field"))?;
 
     let mut tables: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let mut col_remaps: HashMap<String, HashMap<usize, usize>> = HashMap::new();
+
+    // Only use skip_expand for single-table queries to avoid JOIN column conflicts
+    let is_single_table = tables_map.len() == 1;
+
     for (name, key_val) in tables_map {
         let key = key_val
             .as_str()
@@ -263,11 +324,19 @@ async fn load_tables_smart(
                 let hint = hints.get(name.as_str());
                 let predicate = hint.and_then(|h| h.predicate.clone());
 
+                // Column pruning: only read columns the query actually needs
+                let projection = hint.and_then(|h| h.projection.clone());
+
+                // Use skip_expand to avoid null array creation overhead (single-table only)
+                let has_projection = projection.is_some() && is_single_table;
+
                 let start = Instant::now();
                 let batches = parquet_scan(&ParquetScanConfig {
                     path: parquet_dir,
                     predicate,
-                    batch_size: 8192,
+                    projection: projection.clone(),
+                    batch_size: 1_048_576,
+                    skip_expand: has_projection,
                 })
                 .map_err(|e| anyhow::anyhow!("Parquet scan error for '{}': {}", name, e))?;
 
@@ -278,6 +347,15 @@ async fn load_tables_smart(
                     rows,
                     start.elapsed().as_secs_f64() * 1000.0,
                 );
+
+                // Build column remap: original_col_idx -> projected_batch_col_idx
+                if let Some(ref proj_cols) = projection {
+                    let mut remap: HashMap<usize, usize> = HashMap::new();
+                    for (batch_idx, &orig_idx) in proj_cols.iter().enumerate() {
+                        remap.insert(orig_idx, batch_idx);
+                    }
+                    col_remaps.insert(name.clone(), remap);
+                }
 
                 tables.insert(name.clone(), batches);
                 continue;
@@ -295,7 +373,21 @@ async fn load_tables_smart(
         }
         tables.insert(name.clone(), batches);
     }
-    Ok(tables)
+    Ok((tables, col_remaps))
+}
+
+/// Remap column indices in the plan tree for a specific table's scan node.
+/// This is used when we loaded projected Parquet data with skip_expand=true,
+/// meaning the batches have only the projected columns (not the full schema).
+fn remap_plan_for_table(
+    node: &mut prism_substrait::plan::PlanNode,
+    table_name: &str,
+    col_map: &HashMap<usize, usize>,
+) {
+    // Use the PlanNode::remap_columns method which recursively remaps all column references
+    // Only remap if this plan actually references the given table
+    // For simplicity, remap the entire tree (safe since each table has distinct column spaces)
+    node.remap_columns(col_map);
 }
 
 /// Load tables from the partition store, concatenating all chunks into single RecordBatches.

@@ -64,9 +64,11 @@ public class SubstraitSerializer {
 
     /**
      * Serialize a PrismPlanNode tree into Substrait protobuf bytes.
+     * Applies optimizations (e.g., pushing projections into join scans) before serializing.
      */
     public static byte[] serialize(PrismPlanNode node) {
-        Rel rootRel = serializeNode(node);
+        PrismPlanNode optimized = pushProjectionsIntoJoin(node);
+        Rel rootRel = serializeNode(optimized);
 
         Plan plan = Plan.newBuilder()
                 .addRelations(PlanRel.newBuilder()
@@ -79,6 +81,282 @@ public class SubstraitSerializer {
         byte[] bytes = plan.toByteArray();
         LOG.debug("Serialized Substrait plan: {} bytes", bytes.length);
         return bytes;
+    }
+
+    /**
+     * Push column projections through Join nodes into individual Scan nodes.
+     * Transforms: Project([5,6,15], Join(Scan(L,all), Scan(R,all)))
+     * Into:       Project([remapped], Join(Project([0,5,6], Scan(L)), Project([0,2], Scan(R))))
+     *
+     * Also handles nested Project chains: Project(A, Project(B, Join(...)))
+     * by composing A and B into a single Project before pushing into the Join.
+     *
+     * This dramatically reduces I/O — only needed columns are read from Parquet.
+     */
+    private static PrismPlanNode pushProjectionsIntoJoin(PrismPlanNode node) {
+        if (node instanceof PrismPlanNode.Project proj) {
+            PrismPlanNode optimizedInput = pushProjectionsIntoJoin(proj.input());
+
+            // Handle nested Project → Project → Join:
+            // Compose the two Projects into one, then push into the Join.
+            if (optimizedInput instanceof PrismPlanNode.Project innerProj
+                    && innerProj.input() instanceof PrismPlanNode.Join join) {
+                PrismPlanNode composed = composeProjects(proj, innerProj);
+                if (composed instanceof PrismPlanNode.Project composedProj) {
+                    return pushProjectIntoJoin(composedProj, join);
+                }
+                return composed;
+            }
+
+            if (optimizedInput instanceof PrismPlanNode.Join join) {
+                return pushProjectIntoJoin(proj, join);
+            }
+            // Recurse but preserve the Project wrapping
+            if (optimizedInput != proj.input()) {
+                return new PrismPlanNode.Project(optimizedInput, proj.columnIndices(), proj.expressions());
+            }
+            return node;
+        }
+        if (node instanceof PrismPlanNode.Aggregate agg) {
+            return new PrismPlanNode.Aggregate(pushProjectionsIntoJoin(agg.input()), agg.groupBy(), agg.aggregates());
+        }
+        if (node instanceof PrismPlanNode.Filter filter) {
+            return new PrismPlanNode.Filter(pushProjectionsIntoJoin(filter.input()), filter.predicate());
+        }
+        if (node instanceof PrismPlanNode.Sort sort) {
+            return new PrismPlanNode.Sort(pushProjectionsIntoJoin(sort.input()), sort.sortKeys(), sort.limit());
+        }
+        if (node instanceof PrismPlanNode.Join join) {
+            return new PrismPlanNode.Join(
+                    pushProjectionsIntoJoin(join.left()),
+                    pushProjectionsIntoJoin(join.right()),
+                    join.joinType(), join.leftKeys(), join.rightKeys());
+        }
+        return node; // Scan — leaf
+    }
+
+    /**
+     * Given Project([cols], Join(left, right)), push column selections into each side.
+     * Returns a new plan with Project nodes inside the Join for each side.
+     */
+    private static PrismPlanNode pushProjectIntoJoin(PrismPlanNode.Project proj, PrismPlanNode.Join join) {
+        // Determine left/right column counts from scan schemas
+        int leftColCount = countScanColumns(join.left());
+        int rightColCount = countScanColumns(join.right());
+        if (leftColCount <= 0 || rightColCount <= 0) {
+            return proj; // Can't optimize without knowing schema sizes
+        }
+
+        // Collect all needed column indices from the Project + expressions
+        java.util.Set<Integer> neededCols = new java.util.TreeSet<>();
+        for (int col : proj.columnIndices()) {
+            neededCols.add(col);
+        }
+        if (proj.expressions() != null) {
+            for (PrismPlanNode.ScalarExprNode expr : proj.expressions()) {
+                collectExprColumns(expr, neededCols);
+            }
+        }
+
+        // Split into left-side and right-side columns
+        java.util.Set<Integer> leftNeeded = new java.util.TreeSet<>();
+        java.util.Set<Integer> rightNeeded = new java.util.TreeSet<>();
+        for (int col : neededCols) {
+            if (col < leftColCount) {
+                leftNeeded.add(col);
+            } else {
+                rightNeeded.add(col - leftColCount);
+            }
+        }
+
+        // Always include join keys
+        if (join.leftKeys() != null) {
+            for (int key : join.leftKeys()) leftNeeded.add(key);
+        }
+        if (join.rightKeys() != null) {
+            for (int key : join.rightKeys()) rightNeeded.add(key);
+        }
+
+        // If both sides need all columns, nothing to optimize
+        if (leftNeeded.size() >= leftColCount && rightNeeded.size() >= rightColCount) {
+            return proj;
+        }
+
+        // Build left/right projection lists and column remaps
+        List<Integer> leftProjCols = new ArrayList<>(leftNeeded);
+        List<Integer> rightProjCols = new ArrayList<>(rightNeeded);
+        java.util.Map<Integer, Integer> leftRemap = new java.util.HashMap<>();
+        for (int i = 0; i < leftProjCols.size(); i++) {
+            leftRemap.put(leftProjCols.get(i), i);
+        }
+        java.util.Map<Integer, Integer> rightRemap = new java.util.HashMap<>();
+        for (int i = 0; i < rightProjCols.size(); i++) {
+            rightRemap.put(rightProjCols.get(i), i);
+        }
+
+        // Remap join keys
+        List<Integer> newLeftKeys = new ArrayList<>();
+        for (int key : join.leftKeys()) {
+            newLeftKeys.add(leftRemap.getOrDefault(key, key));
+        }
+        List<Integer> newRightKeys = new ArrayList<>();
+        for (int key : join.rightKeys()) {
+            newRightKeys.add(rightRemap.getOrDefault(key, key));
+        }
+
+        // Build inner Project nodes
+        PrismPlanNode leftSide = leftProjCols.size() < leftColCount
+                ? new PrismPlanNode.Project(join.left(), leftProjCols)
+                : join.left();
+        PrismPlanNode rightSide = rightProjCols.size() < rightColCount
+                ? new PrismPlanNode.Project(join.right(), rightProjCols)
+                : join.right();
+
+        PrismPlanNode newJoin = new PrismPlanNode.Join(leftSide, rightSide, join.joinType(), newLeftKeys, newRightKeys);
+        int newLeftCount = leftProjCols.size();
+
+        // Remap outer Project column indices to the new join output positions
+        List<Integer> newOuterCols = new ArrayList<>();
+        for (int col : proj.columnIndices()) {
+            if (col < leftColCount) {
+                newOuterCols.add(leftRemap.getOrDefault(col, col));
+            } else {
+                int rightIdx = col - leftColCount;
+                newOuterCols.add(newLeftCount + rightRemap.getOrDefault(rightIdx, rightIdx));
+            }
+        }
+
+        // Remap expressions
+        List<PrismPlanNode.ScalarExprNode> newExprs = null;
+        if (proj.expressions() != null && !proj.expressions().isEmpty()) {
+            newExprs = new ArrayList<>();
+            for (PrismPlanNode.ScalarExprNode expr : proj.expressions()) {
+                newExprs.add(remapExprColumns(expr, leftColCount, leftRemap, newLeftCount, rightRemap));
+            }
+        }
+
+        LOG.info("Pushed projections into join: left {} cols -> {}, right {} cols -> {}", leftColCount, leftProjCols, rightColCount, rightProjCols);
+
+        return new PrismPlanNode.Project(newJoin, newOuterCols, newExprs != null ? newExprs : List.of());
+    }
+
+    /**
+     * Compose two nested Projects into a single Project.
+     * Given outer = Project(A_cols, A_exprs) over inner = Project(B_cols, B_exprs, input),
+     * produces a single Project(composed_cols, composed_exprs, input) that is equivalent
+     * to applying inner then outer.
+     */
+    private static PrismPlanNode composeProjects(PrismPlanNode.Project outer, PrismPlanNode.Project inner) {
+        int innerPassCount = inner.columnIndices().size();
+        int innerExprCount = (inner.expressions() != null) ? inner.expressions().size() : 0;
+
+        List<Integer> newCols = new ArrayList<>();
+        List<PrismPlanNode.ScalarExprNode> newExprs = new ArrayList<>();
+
+        // Resolve outer column references through inner
+        for (int outerIdx : outer.columnIndices()) {
+            if (outerIdx < innerPassCount) {
+                // References a passthrough column in inner → resolve to input column
+                newCols.add(inner.columnIndices().get(outerIdx));
+            } else {
+                // References an expression result from inner → pull the expression
+                int exprIdx = outerIdx - innerPassCount;
+                if (exprIdx < innerExprCount) {
+                    newExprs.add(inner.expressions().get(exprIdx));
+                }
+            }
+        }
+
+        // Resolve outer expressions through inner
+        if (outer.expressions() != null) {
+            for (PrismPlanNode.ScalarExprNode outerExpr : outer.expressions()) {
+                newExprs.add(resolveExprThroughProject(outerExpr, inner));
+            }
+        }
+
+        LOG.info("composeProjects: outer cols={} exprs={}, inner cols={} exprs={} -> composed cols={} exprs={}",
+                outer.columnIndices().size(),
+                outer.expressions() != null ? outer.expressions().size() : 0,
+                innerPassCount, innerExprCount,
+                newCols.size(), newExprs.size());
+
+        return new PrismPlanNode.Project(inner.input(), newCols, newExprs);
+    }
+
+    /**
+     * Resolve column references in an expression through an inner Project.
+     * Replaces ColumnRef indices that reference inner output positions with
+     * the corresponding input column or expression.
+     */
+    private static PrismPlanNode.ScalarExprNode resolveExprThroughProject(
+            PrismPlanNode.ScalarExprNode expr, PrismPlanNode.Project inner) {
+        if (expr instanceof PrismPlanNode.ScalarExprNode.ColumnRef ref) {
+            int idx = ref.columnIndex();
+            int innerPassCount = inner.columnIndices().size();
+            if (idx < innerPassCount) {
+                // Maps to an input column through the inner passthrough
+                return new PrismPlanNode.ScalarExprNode.ColumnRef(inner.columnIndices().get(idx));
+            } else {
+                // Maps to an inner expression result — inline the expression
+                int exprIdx = idx - innerPassCount;
+                if (inner.expressions() != null && exprIdx < inner.expressions().size()) {
+                    return inner.expressions().get(exprIdx);
+                }
+            }
+            return ref;
+        }
+        if (expr instanceof PrismPlanNode.ScalarExprNode.ArithmeticCall call) {
+            List<PrismPlanNode.ScalarExprNode> newArgs = new ArrayList<>();
+            for (PrismPlanNode.ScalarExprNode arg : call.args()) {
+                newArgs.add(resolveExprThroughProject(arg, inner));
+            }
+            return new PrismPlanNode.ScalarExprNode.ArithmeticCall(call.op(), newArgs);
+        }
+        return expr; // Literal — no resolution needed
+    }
+
+    private static int countScanColumns(PrismPlanNode node) {
+        if (node instanceof PrismPlanNode.Scan scan) {
+            return scan.columns() != null ? scan.columns().size() : 0;
+        }
+        if (node instanceof PrismPlanNode.Filter f) return countScanColumns(f.input());
+        if (node instanceof PrismPlanNode.Project p) return countScanColumns(p.input());
+        return 0;
+    }
+
+    private static void collectExprColumns(PrismPlanNode.ScalarExprNode expr, java.util.Set<Integer> cols) {
+        if (expr instanceof PrismPlanNode.ScalarExprNode.ColumnRef ref) {
+            cols.add(ref.columnIndex());
+        } else if (expr instanceof PrismPlanNode.ScalarExprNode.ArithmeticCall call) {
+            for (PrismPlanNode.ScalarExprNode arg : call.args()) {
+                collectExprColumns(arg, cols);
+            }
+        }
+    }
+
+    private static PrismPlanNode.ScalarExprNode remapExprColumns(
+            PrismPlanNode.ScalarExprNode expr,
+            int leftColCount,
+            java.util.Map<Integer, Integer> leftRemap,
+            int newLeftCount,
+            java.util.Map<Integer, Integer> rightRemap) {
+        if (expr instanceof PrismPlanNode.ScalarExprNode.ColumnRef ref) {
+            int col = ref.columnIndex();
+            if (col < leftColCount) {
+                return new PrismPlanNode.ScalarExprNode.ColumnRef(leftRemap.getOrDefault(col, col));
+            } else {
+                int rightIdx = col - leftColCount;
+                return new PrismPlanNode.ScalarExprNode.ColumnRef(newLeftCount + rightRemap.getOrDefault(rightIdx, rightIdx));
+            }
+        }
+        if (expr instanceof PrismPlanNode.ScalarExprNode.ArithmeticCall call) {
+            List<PrismPlanNode.ScalarExprNode> newArgs = new ArrayList<>();
+            for (PrismPlanNode.ScalarExprNode arg : call.args()) {
+                newArgs.add(remapExprColumns(arg, leftColCount, leftRemap, newLeftCount, rightRemap));
+            }
+            return new PrismPlanNode.ScalarExprNode.ArithmeticCall(call.op(), newArgs);
+        }
+        return expr; // Literal — no remapping
     }
 
     private static Rel serializeNode(PrismPlanNode node) {

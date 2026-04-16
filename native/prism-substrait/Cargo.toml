@@ -19,3 +19,4 @@ datafusion-expr = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+rayon = { workspace = true }

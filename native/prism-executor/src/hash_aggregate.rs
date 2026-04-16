@@ -10,12 +10,13 @@ use std::sync::Arc;
 use arrow::compute::kernels::aggregate as arrow_agg;
 use arrow_array::{
     cast::AsArray, Array, ArrayRef, Float64Array, Int64Array, RecordBatch,
-    types::{Float32Type, Float64Type, Int32Type, Int64Type, UInt64Type},
+    types::{Float64Type, Int32Type, Int64Type},
 };
 use arrow_cast::cast;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use rayon::prelude::*;
 
-use crate::{PrismError, Result};
+use crate::Result;
 
 /// Supported aggregate functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +50,7 @@ struct GroupAccumulator {
     count: u64,
     min: f64,
     max: f64,
-    distinct_hashes: Option<Vec<u64>>,
+    distinct_hashes: Option<HashSet<u64>>,
 }
 
 impl GroupAccumulator {
@@ -59,19 +60,29 @@ impl GroupAccumulator {
             count: 0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
-            distinct_hashes: if track_distinct { Some(Vec::new()) } else { None },
+            distinct_hashes: if track_distinct { Some(HashSet::new()) } else { None },
         }
     }
 
+    #[inline(always)]
     fn accumulate(&mut self, value: f64) {
         self.sum += value;
         self.count += 1;
         if value < self.min { self.min = value; }
         if value > self.max { self.max = value; }
         if let Some(ref mut dv) = self.distinct_hashes {
-            let h = value.to_bits();
-            if !dv.contains(&h) {
-                dv.push(h);
+            dv.insert(value.to_bits());
+        }
+    }
+
+    fn merge(&mut self, other: &GroupAccumulator) {
+        self.sum += other.sum;
+        self.count += other.count;
+        if other.min < self.min { self.min = other.min; }
+        if other.max > self.max { self.max = other.max; }
+        if let (Some(ref mut dv), Some(ref other_dv)) = (&mut self.distinct_hashes, &other.distinct_hashes) {
+            for &v in other_dv {
+                dv.insert(v);
             }
         }
     }
@@ -105,7 +116,6 @@ pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -
 
     if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
         let schema = if batches.is_empty() {
-            // Fallback: build a schema from config field names
             let mut fields: Vec<Arc<Field>> = Vec::new();
             for agg in &config.aggregates {
                 let dt = match agg.func {
@@ -121,45 +131,80 @@ pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -
         return build_empty_result(schema, config);
     }
 
-    // We need a reference batch for group-key extraction (take from first non-empty)
     let ref_batch = batches.iter().find(|b| b.num_rows() > 0).unwrap();
 
-    // Map group hash → (batch_index, first_row_index, per-agg accumulators)
-    let mut groups: HashMap<u64, (usize, usize, Vec<GroupAccumulator>)> = HashMap::new();
+    // Parallel aggregation: partition batches across rayon threads,
+    // each builds its own HashMap, then merge.
+    let non_empty: Vec<(usize, &RecordBatch)> = batches.iter()
+        .enumerate()
+        .filter(|(_, b)| b.num_rows() > 0)
+        .collect();
+
+    // Each chunk produces: HashMap<group_hash, (batch_idx, row_idx, accumulators)>
+    type GroupMap = HashMap<u64, (usize, usize, Vec<GroupAccumulator>)>;
+
+    let chunk_size = (non_empty.len() / rayon::current_num_threads().max(1)).max(1);
+    let partial_maps: Vec<(GroupMap, Vec<u64>)> = non_empty
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let mut groups: GroupMap = HashMap::new();
+            let mut group_order: Vec<u64> = Vec::new();
+
+            for &(batch_idx, batch) in chunk {
+                let num_rows = batch.num_rows();
+
+                let agg_arrays: Vec<Float64Array> = config.aggregates.iter()
+                    .map(|agg| {
+                        let col = batch.column(agg.column);
+                        if col.data_type() == &DataType::Float64 {
+                            col.as_primitive::<Float64Type>().clone()
+                        } else {
+                            cast(col, &DataType::Float64)
+                                .expect("cast to f64")
+                                .as_primitive::<Float64Type>()
+                                .clone()
+                        }
+                    })
+                    .collect();
+
+                for row in 0..num_rows {
+                    let gh = hash_group_keys(batch, &config.group_by, row);
+                    let entry = groups.entry(gh).or_insert_with(|| {
+                        group_order.push(gh);
+                        let accums = config.aggregates.iter()
+                            .map(|agg| GroupAccumulator::new(agg.func == AggFunc::CountDistinct))
+                            .collect();
+                        (batch_idx, row, accums)
+                    });
+
+                    for (agg_idx, _agg) in config.aggregates.iter().enumerate() {
+                        let value = agg_arrays[agg_idx].value(row);
+                        entry.2[agg_idx].accumulate(value);
+                    }
+                }
+            }
+            (groups, group_order)
+        })
+        .collect();
+
+    // Merge partial maps into a single result
+    let mut groups: GroupMap = HashMap::new();
     let mut group_order: Vec<u64> = Vec::new();
 
-    for (batch_idx, batch) in batches.iter().enumerate() {
-        let num_rows = batch.num_rows();
-        if num_rows == 0 { continue; }
-
-        // Pre-cast aggregate columns to Float64 for fast typed access
-        let agg_arrays: Vec<Float64Array> = config.aggregates.iter()
-            .map(|agg| {
-                let col = batch.column(agg.column);
-                if col.data_type() == &DataType::Float64 {
-                    col.as_primitive::<Float64Type>().clone()
-                } else {
-                    cast(col, &DataType::Float64)
-                        .expect("cast to f64")
-                        .as_primitive::<Float64Type>()
-                        .clone()
+    for (partial, partial_order) in partial_maps {
+        for gh in partial_order {
+            if let Some((bi, ri, accums)) = partial.get(&gh) {
+                let entry = groups.entry(gh).or_insert_with(|| {
+                    group_order.push(gh);
+                    let accums = config.aggregates.iter()
+                        .map(|agg| GroupAccumulator::new(agg.func == AggFunc::CountDistinct))
+                        .collect();
+                    (*bi, *ri, accums)
+                });
+                // Merge accumulators
+                for (agg_idx, acc) in accums.iter().enumerate() {
+                    entry.2[agg_idx].merge(acc);
                 }
-            })
-            .collect();
-
-        for row in 0..num_rows {
-            let gh = hash_group_keys(batch, &config.group_by, row);
-            let entry = groups.entry(gh).or_insert_with(|| {
-                group_order.push(gh);
-                let accums = config.aggregates.iter()
-                    .map(|agg| GroupAccumulator::new(agg.func == AggFunc::CountDistinct))
-                    .collect();
-                (batch_idx, row, accums)
-            });
-
-            for (agg_idx, _agg) in config.aggregates.iter().enumerate() {
-                let value = agg_arrays[agg_idx].value(row);
-                entry.2[agg_idx].accumulate(value);
             }
         }
     }
@@ -168,7 +213,6 @@ pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -
     let mut output_columns: Vec<ArrayRef> = Vec::new();
     let mut output_fields: Vec<Arc<Field>> = Vec::new();
 
-    // Group-by columns — take from the batch where the group was first seen
     for &col_idx in &config.group_by {
         let field = ref_batch.schema().field(col_idx).clone();
         let mut values: Vec<ArrayRef> = Vec::new();
@@ -183,7 +227,6 @@ pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -
         output_columns.push(concatenated);
     }
 
-    // Aggregate result columns
     for (agg_idx, agg) in config.aggregates.iter().enumerate() {
         let values: Vec<f64> = group_order.iter()
             .map(|gh| groups[gh].2[agg_idx].result(agg.func))
@@ -210,9 +253,7 @@ pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -
 }
 
 /// Fast path for global aggregates (no GROUP BY) using Arrow SIMD compute kernels.
-///
-/// Instead of row-by-row accumulation through a hash map, this uses vectorized
-/// `sum()`, `min()`, `max()` kernels that process entire columns at once.
+/// Uses rayon for parallel processing across batches.
 fn global_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -> Result<RecordBatch> {
     let mut output_fields: Vec<Arc<Field>> = Vec::new();
     let mut output_columns: Vec<ArrayRef> = Vec::new();
@@ -225,72 +266,81 @@ fn global_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -> 
 
         let result_value: f64 = match agg.func {
             AggFunc::Sum => {
-                let mut total = 0.0f64;
-                for batch in batches {
-                    if batch.num_rows() == 0 { continue; }
-                    let f64_col = cast_to_f64(batch.column(agg.column))?;
-                    if let Some(s) = arrow_agg::sum(f64_col.as_primitive::<Float64Type>()) {
-                        total += s;
-                    }
-                }
-                total
+                let partials: Vec<f64> = batches.par_iter()
+                    .filter(|b| b.num_rows() > 0)
+                    .map(|batch| {
+                        let f64_col = cast_to_f64(batch.column(agg.column)).unwrap();
+                        arrow_agg::sum(f64_col.as_primitive::<Float64Type>()).unwrap_or(0.0)
+                    })
+                    .collect();
+                partials.iter().sum()
             }
             AggFunc::Count => {
-                let mut total = 0u64;
-                for batch in batches {
-                    let col = batch.column(agg.column);
-                    total += (col.len() - col.null_count()) as u64;
-                }
-                total as f64
+                let partials: Vec<u64> = batches.par_iter()
+                    .map(|batch| {
+                        let col = batch.column(agg.column);
+                        (col.len() - col.null_count()) as u64
+                    })
+                    .collect();
+                partials.iter().sum::<u64>() as f64
             }
             AggFunc::Avg => {
-                let mut total_sum = 0.0f64;
-                let mut total_count = 0u64;
-                for batch in batches {
-                    if batch.num_rows() == 0 { continue; }
-                    let col = batch.column(agg.column);
-                    let f64_col = cast_to_f64(col)?;
-                    if let Some(s) = arrow_agg::sum(f64_col.as_primitive::<Float64Type>()) {
-                        total_sum += s;
-                    }
-                    total_count += (col.len() - col.null_count()) as u64;
-                }
+                let partials: Vec<(f64, u64)> = batches.par_iter()
+                    .filter(|b| b.num_rows() > 0)
+                    .map(|batch| {
+                        let col = batch.column(agg.column);
+                        let f64_col = cast_to_f64(col).unwrap();
+                        let s = arrow_agg::sum(f64_col.as_primitive::<Float64Type>()).unwrap_or(0.0);
+                        let c = (col.len() - col.null_count()) as u64;
+                        (s, c)
+                    })
+                    .collect();
+                let total_sum: f64 = partials.iter().map(|(s, _)| s).sum();
+                let total_count: u64 = partials.iter().map(|(_, c)| c).sum();
                 if total_count > 0 { total_sum / total_count as f64 } else { 0.0 }
             }
             AggFunc::Min => {
-                let mut global_min = f64::INFINITY;
-                for batch in batches {
-                    if batch.num_rows() == 0 { continue; }
-                    let f64_col = cast_to_f64(batch.column(agg.column))?;
-                    if let Some(m) = arrow_agg::min(f64_col.as_primitive::<Float64Type>()) {
-                        if m < global_min { global_min = m; }
-                    }
-                }
+                let partials: Vec<f64> = batches.par_iter()
+                    .filter(|b| b.num_rows() > 0)
+                    .filter_map(|batch| {
+                        let f64_col = cast_to_f64(batch.column(agg.column)).ok()?;
+                        arrow_agg::min(f64_col.as_primitive::<Float64Type>())
+                    })
+                    .collect();
+                let global_min = partials.iter().cloned().fold(f64::INFINITY, f64::min);
                 if global_min == f64::INFINITY { 0.0 } else { global_min }
             }
             AggFunc::Max => {
-                let mut global_max = f64::NEG_INFINITY;
-                for batch in batches {
-                    if batch.num_rows() == 0 { continue; }
-                    let f64_col = cast_to_f64(batch.column(agg.column))?;
-                    if let Some(m) = arrow_agg::max(f64_col.as_primitive::<Float64Type>()) {
-                        if m > global_max { global_max = m; }
-                    }
-                }
+                let partials: Vec<f64> = batches.par_iter()
+                    .filter(|b| b.num_rows() > 0)
+                    .filter_map(|batch| {
+                        let f64_col = cast_to_f64(batch.column(agg.column)).ok()?;
+                        arrow_agg::max(f64_col.as_primitive::<Float64Type>())
+                    })
+                    .collect();
+                let global_max = partials.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 if global_max == f64::NEG_INFINITY { 0.0 } else { global_max }
             }
             AggFunc::CountDistinct => {
-                let mut distinct: HashSet<u64> = HashSet::new();
-                for batch in batches {
-                    let f64_col = cast_to_f64(batch.column(agg.column))?;
-                    let arr = f64_col.as_primitive::<Float64Type>();
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            distinct.insert(arr.value(i).to_bits());
+                let partial_sets: Vec<HashSet<u64>> = batches.par_iter()
+                    .map(|batch| {
+                        let mut set = HashSet::new();
+                        if let Ok(f64_col) = cast_to_f64(batch.column(agg.column)) {
+                            let arr = f64_col.as_primitive::<Float64Type>();
+                            for i in 0..arr.len() {
+                                if !arr.is_null(i) {
+                                    set.insert(arr.value(i).to_bits());
+                                }
+                            }
                         }
-                    }
+                        set
+                    })
+                    .collect();
+                let mut merged: HashSet<u64> = HashSet::new();
+                for set in partial_sets {
+                    merged.extend(set);
                 }
-                distinct.len() as f64
+                merged.len() as f64
             }
         };
 
@@ -307,7 +357,6 @@ fn global_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -> 
     Ok(RecordBatch::try_new(schema, output_columns)?)
 }
 
-/// Cast an array to Float64 if it isn't already.
 fn cast_to_f64(array: &ArrayRef) -> Result<ArrayRef> {
     if array.data_type() == &DataType::Float64 {
         Ok(array.clone())
@@ -336,17 +385,6 @@ fn hash_array_value(array: &dyn Array, row: usize, hasher: &mut impl Hasher) {
         DataType::Float64 => array.as_primitive::<Float64Type>().value(row).to_bits().hash(hasher),
         DataType::Utf8 => array.as_string::<i32>().value(row).hash(hasher),
         _ => format!("{:?}", array.slice(row, 1)).hash(hasher),
-    }
-}
-
-fn get_numeric_value(array: &dyn Array, row: usize) -> Result<f64> {
-    match array.data_type() {
-        DataType::Int32 => Ok(array.as_primitive::<Int32Type>().value(row) as f64),
-        DataType::Int64 => Ok(array.as_primitive::<Int64Type>().value(row) as f64),
-        DataType::Float32 => Ok(array.as_primitive::<Float32Type>().value(row) as f64),
-        DataType::Float64 => Ok(array.as_primitive::<Float64Type>().value(row)),
-        DataType::UInt64 => Ok(array.as_primitive::<UInt64Type>().value(row) as f64),
-        dt => Err(PrismError::UnsupportedAggregation(format!("{:?}", dt))),
     }
 }
 

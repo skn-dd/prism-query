@@ -16,10 +16,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.logging.Logger;
 
 import io.airlift.slice.Slices;
 
 public class PrismPageSource implements ConnectorPageSource {
+    private static final Logger LOG = Logger.getLogger(PrismPageSource.class.getName());
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final PrismFlightExecutor executor;
@@ -75,6 +77,10 @@ public class PrismPageSource implements ConnectorPageSource {
                 int workerCount = executor.workerCount();
                 if (workerCount > 1 && hasAggregation()) {
                     executeOnAllWorkers();
+                } else if (workerCount > 1 && hasSortWithLimit()) {
+                    executeOnAllWorkersSort();
+                } else if (workerCount > 1 && hasJoin()) {
+                    executeOnAllWorkersConcat();
                 } else {
                     executeOnWorker();
                 }
@@ -113,7 +119,7 @@ public class PrismPageSource implements ConnectorPageSource {
 
     private boolean hasAggregation() {
         return tableHandle.getPushedPlan()
-                .map(this::findAggregateNode)
+                .flatMap(this::findAggregateNode)
                 .isPresent();
     }
 
@@ -124,7 +130,108 @@ public class PrismPageSource implements ConnectorPageSource {
         if (node instanceof PrismPlanNode.Sort sort) {
             return findAggregateNode(sort.input());
         }
+        if (node instanceof PrismPlanNode.Project proj) {
+            return findAggregateNode(proj.input());
+        }
         return Optional.empty();
+    }
+
+    private boolean hasSortWithLimit() {
+        return tableHandle.getPushedPlan()
+                .flatMap(this::findSortNode)
+                .isPresent();
+    }
+
+    private Optional<PrismPlanNode.Sort> findSortNode(PrismPlanNode node) {
+        if (node instanceof PrismPlanNode.Sort sort && sort.limit() != null && sort.limit() > 0) {
+            return Optional.of(sort);
+        }
+        return Optional.empty();
+    }
+
+    private boolean hasJoin() {
+        return tableHandle.getPushedPlan()
+                .map(this::findJoinNode)
+                .orElse(false);
+    }
+
+    private boolean findJoinNode(PrismPlanNode node) {
+        if (node instanceof PrismPlanNode.Join) return true;
+        if (node instanceof PrismPlanNode.Filter f) return findJoinNode(f.input());
+        if (node instanceof PrismPlanNode.Project p) return findJoinNode(p.input());
+        if (node instanceof PrismPlanNode.Aggregate a) return findJoinNode(a.input());
+        if (node instanceof PrismPlanNode.Sort s) return findJoinNode(s.input());
+        return false;
+    }
+
+    /**
+     * Fan-out: execute join plan on all workers, concatenate results.
+     * Each worker joins its local lineitem/orders partitions.
+     * Trino handles subsequent aggregation.
+     */
+    private void executeOnAllWorkersConcat() throws Exception {
+        PrismPlanNode plan = tableHandle.getPushedPlan().orElseThrow();
+        byte[] substraitBytes = SubstraitSerializer.serialize(plan);
+        String planB64 = Base64.getEncoder().encodeToString(substraitBytes);
+
+        int workerCount = executor.workerCount();
+        String[] resultKeys = new String[workerCount];
+
+        ObjectNode tablesTemplate = MAPPER.createObjectNode();
+        tablesTemplate.put(tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
+        addJoinTables(plan, tablesTemplate);
+
+        // Execute on all workers in parallel
+        CompletableFuture<?>[] futures = new CompletableFuture[workerCount];
+        for (int i = 0; i < workerCount; i++) {
+            final int wi = i;
+            resultKeys[i] = "result/" + UUID.randomUUID();
+            ObjectNode command = MAPPER.createObjectNode();
+            command.put("substrait_plan_b64", planB64);
+            command.put("result_key", resultKeys[i]);
+            command.set("tables", tablesTemplate.deepCopy());
+            String cmdJson = MAPPER.writeValueAsString(command);
+            futures[i] = CompletableFuture.runAsync(() -> {
+                try {
+                    executor.executeQuery(wi, cmdJson);
+                } catch (Exception e) {
+                    throw new RuntimeException("Worker " + wi + " failed: " + e.getMessage(), e);
+                }
+            });
+        }
+        CompletableFuture.allOf(futures).join();
+
+        // Collect all rows from all workers
+        List<Object[]> allRows = new ArrayList<>();
+        for (int wi = 0; wi < workerCount; wi++) {
+            try (FlightStream stream = executor.fetchResultStream(wi, resultKeys[wi])) {
+                VectorSchemaRoot workerRoot = stream.getRoot();
+                while (stream.next()) {
+                    int vecCount = workerRoot.getFieldVectors().size();
+                    for (int row = 0; row < workerRoot.getRowCount(); row++) {
+                        Object[] values = new Object[columns.size()];
+                        for (int c = 0; c < columns.size(); c++) {
+                            if (c < vecCount) {
+                                values[c] = extractValue(workerRoot.getVector(c), row);
+                            }
+                        }
+                        allRows.add(values);
+                    }
+                }
+            }
+        }
+
+        mergedPage = buildSortedPage(allRows);
+    }
+
+    private List<Integer> findProjectColumns(PrismPlanNode node) {
+        if (node instanceof PrismPlanNode.Sort sort) {
+            return findProjectColumns(sort.input());
+        }
+        if (node instanceof PrismPlanNode.Project proj) {
+            return proj.columnIndices();
+        }
+        return null;
     }
 
     /**
@@ -249,12 +356,154 @@ public class PrismPageSource implements ConnectorPageSource {
         mergedPage = buildMergedPage(finalResults, groupByCount, originalAggs);
     }
 
+    /**
+     * Fan-out: execute Sort/TopN plan on all workers, merge-sort results, apply final limit.
+     */
+    private void executeOnAllWorkersSort() throws Exception {
+        PrismPlanNode plan = tableHandle.getPushedPlan().orElseThrow();
+        PrismPlanNode.Sort sortNode = findSortNode(plan).orElseThrow();
+        long limit = sortNode.limit();
+
+        byte[] substraitBytes = SubstraitSerializer.serialize(plan);
+        String planB64 = Base64.getEncoder().encodeToString(substraitBytes);
+
+        int workerCount = executor.workerCount();
+        String[] resultKeys = new String[workerCount];
+
+        ObjectNode tablesTemplate = MAPPER.createObjectNode();
+        tablesTemplate.put(tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
+        addJoinTables(plan, tablesTemplate);
+
+        // Execute on all workers in parallel
+        CompletableFuture<?>[] futures = new CompletableFuture[workerCount];
+        for (int i = 0; i < workerCount; i++) {
+            final int wi = i;
+            resultKeys[i] = "result/" + UUID.randomUUID();
+            ObjectNode command = MAPPER.createObjectNode();
+            command.put("substrait_plan_b64", planB64);
+            command.put("result_key", resultKeys[i]);
+            command.set("tables", tablesTemplate.deepCopy());
+            String cmdJson = MAPPER.writeValueAsString(command);
+            futures[i] = CompletableFuture.runAsync(() -> {
+                try {
+                    executor.executeQuery(wi, cmdJson);
+                } catch (Exception e) {
+                    throw new RuntimeException("Worker " + wi + " failed: " + e.getMessage(), e);
+                }
+            });
+        }
+        CompletableFuture.allOf(futures).join();
+
+        // The plan is Sort(Project([orig_col_indices...]), ...) — worker returns
+        // only the projected columns. Build mapping from original table index to
+        // projected vector position.
+        List<PrismPlanNode.SortKeyDef> sortKeys = sortNode.sortKeys();
+
+        List<Integer> projCols = findProjectColumns(plan);
+        Map<Integer, Integer> origToProj = new HashMap<>();
+        if (projCols != null) {
+            for (int p = 0; p < projCols.size(); p++) {
+                origToProj.put(projCols.get(p), p);
+            }
+        }
+
+        // Collect rows from all workers
+        List<Object[]> flatRows = new ArrayList<>();
+        for (int wi = 0; wi < workerCount; wi++) {
+            try (FlightStream stream = executor.fetchResultStream(wi, resultKeys[wi])) {
+                VectorSchemaRoot workerRoot = stream.getRoot();
+                while (stream.next()) {
+                    int vecCount = workerRoot.getFieldVectors().size();
+                    for (int row = 0; row < workerRoot.getRowCount(); row++) {
+                        Object[] values = new Object[columns.size()];
+                        for (int c = 0; c < columns.size(); c++) {
+                            int origIdx = columns.get(c).getColumnIndex();
+                            int vecIdx = projCols != null
+                                    ? origToProj.getOrDefault(origIdx, -1)
+                                    : origIdx;
+                            if (vecIdx >= 0 && vecIdx < vecCount) {
+                                values[c] = extractValue(workerRoot.getVector(vecIdx), row);
+                            }
+                        }
+                        flatRows.add(values);
+                    }
+                }
+            }
+        }
+
+        // Map sort key (in projected space) to slot in row array
+        // Sort keys reference projected positions; find which output column that maps to
+        Map<Integer, Integer> projPosToSlot = new HashMap<>();
+        for (int c = 0; c < columns.size(); c++) {
+            int origIdx = columns.get(c).getColumnIndex();
+            int projIdx = projCols != null
+                    ? origToProj.getOrDefault(origIdx, origIdx)
+                    : origIdx;
+            projPosToSlot.put(projIdx, c);
+        }
+
+        // Merge-sort by sort keys, then apply limit
+        flatRows.sort((a, b) -> {
+            for (PrismPlanNode.SortKeyDef key : sortKeys) {
+                Integer slot = projPosToSlot.get(key.columnIndex());
+                if (slot == null) continue;
+
+                @SuppressWarnings("unchecked")
+                Comparable<Object> va = (Comparable<Object>) a[slot];
+                @SuppressWarnings("unchecked")
+                Comparable<Object> vb = (Comparable<Object>) b[slot];
+                if (va == null && vb == null) continue;
+                if (va == null) return "ASC".equals(key.direction()) ? -1 : 1;
+                if (vb == null) return "ASC".equals(key.direction()) ? 1 : -1;
+
+                int cmp = va.compareTo(vb);
+                if ("DESC".equals(key.direction())) cmp = -cmp;
+                if (cmp != 0) return cmp;
+            }
+            return 0;
+        });
+
+        int finalLimit = (int) Math.min(limit, flatRows.size());
+        List<Object[]> topN = flatRows.subList(0, finalLimit);
+
+        mergedPage = buildSortedPage(topN);
+    }
+
+    private Page buildSortedPage(List<Object[]> rows) {
+        int rowCount = rows.size();
+        if (rowCount == 0 || columns.isEmpty()) {
+            return new Page(rowCount);
+        }
+
+        BlockBuilder[] builders = new BlockBuilder[columns.size()];
+        Type[] types = new Type[columns.size()];
+        for (int c = 0; c < columns.size(); c++) {
+            types[c] = columns.get(c).getType();
+            builders[c] = types[c].createBlockBuilder(null, rowCount);
+        }
+
+        for (Object[] row : rows) {
+            for (int c = 0; c < columns.size(); c++) {
+                writeValue(builders[c], types[c], row[c]);
+            }
+        }
+
+        var blocks = new io.trino.spi.block.Block[columns.size()];
+        for (int c = 0; c < columns.size(); c++) {
+            blocks[c] = builders[c].build();
+        }
+        return new Page(rowCount, blocks);
+    }
+
     private PrismPlanNode replaceAggregates(PrismPlanNode plan, PrismPlanNode.Aggregate originalAgg, List<PrismPlanNode.AggregateExpr> newAggs) {
         if (plan instanceof PrismPlanNode.Aggregate) {
             return new PrismPlanNode.Aggregate(originalAgg.input(), originalAgg.groupBy(), newAggs);
         }
         if (plan instanceof PrismPlanNode.Sort sort) {
             return new PrismPlanNode.Sort(replaceAggregates(sort.input(), originalAgg, newAggs), sort.sortKeys(), sort.limit());
+        }
+        if (plan instanceof PrismPlanNode.Project proj) {
+            return new PrismPlanNode.Project(replaceAggregates(proj.input(), originalAgg, newAggs), proj.columnIndices(), proj.expressions());
         }
         return plan;
     }
@@ -418,19 +667,27 @@ public class PrismPageSource implements ConnectorPageSource {
     }
 
     private void addJoinTables(PrismPlanNode node, ObjectNode tablesNode) {
+        addJoinTablesImpl(node, tablesNode, false);
+    }
+
+    private void addJoinTablesImpl(PrismPlanNode node, ObjectNode tablesNode, boolean broadcast) {
         if (node instanceof PrismPlanNode.Join join) {
-            addJoinTables(join.left(), tablesNode);
-            addJoinTables(join.right(), tablesNode);
+            addJoinTablesImpl(join.left(), tablesNode, false);
+            // Right side of join uses broadcast (all workers read full table)
+            addJoinTablesImpl(join.right(), tablesNode, true);
         } else if (node instanceof PrismPlanNode.Filter filter) {
-            addJoinTables(filter.input(), tablesNode);
+            addJoinTablesImpl(filter.input(), tablesNode, broadcast);
         } else if (node instanceof PrismPlanNode.Project project) {
-            addJoinTables(project.input(), tablesNode);
+            addJoinTablesImpl(project.input(), tablesNode, broadcast);
         } else if (node instanceof PrismPlanNode.Aggregate agg) {
-            addJoinTables(agg.input(), tablesNode);
+            addJoinTablesImpl(agg.input(), tablesNode, broadcast);
         } else if (node instanceof PrismPlanNode.Sort sort) {
-            addJoinTables(sort.input(), tablesNode);
+            addJoinTablesImpl(sort.input(), tablesNode, broadcast);
         } else if (node instanceof PrismPlanNode.Scan scan) {
-            tablesNode.put(scan.tableName(), "tpch/" + scan.tableName());
+            String path = broadcast
+                    ? "tpch/" + scan.tableName() + "_broadcast"
+                    : "tpch/" + scan.tableName();
+            tablesNode.put(scan.tableName(), path);
         }
     }
 }

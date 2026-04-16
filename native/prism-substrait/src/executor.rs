@@ -1,12 +1,12 @@
 //! Plan executor — walks a PlanNode tree and executes it against a table registry.
 //!
-//! Extracted from prism-jni to be reusable by both the JNI bridge and
-//! the Arrow Flight worker path.
+//! Uses rayon for parallel batch processing on filter/project operations.
 
 use std::collections::HashMap;
 
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
+use rayon::prelude::*;
 
 use prism_executor::filter_project;
 use prism_executor::hash_aggregate;
@@ -17,8 +17,6 @@ use crate::plan::PlanNode;
 use crate::{Result, SubstraitError};
 
 /// Execute a PlanNode tree against a table registry (single RecordBatch per table).
-///
-/// Convenience wrapper — converts to chunked format and delegates to `execute_plan_chunked`.
 pub fn execute_plan(
     node: &PlanNode,
     tables: &HashMap<String, RecordBatch>,
@@ -31,10 +29,6 @@ pub fn execute_plan(
 }
 
 /// Execute a PlanNode tree against a chunked table registry.
-///
-/// Each table maps to a `Vec<RecordBatch>` (chunks). This avoids materializing
-/// all chunks into a single giant RecordBatch, which is critical for SF100+
-/// where a single lineitem table can be 40+ GB.
 pub fn execute_plan_chunked(
     node: &PlanNode,
     tables: &HashMap<String, Vec<RecordBatch>>,
@@ -72,12 +66,27 @@ fn execute_node(
 
         PlanNode::Filter { input, predicate } => {
             let child_batches = execute_node(input, tables)?;
+
+            // Parallel filter: process batches concurrently with rayon
+            let results: Vec<std::result::Result<Option<RecordBatch>, SubstraitError>> = child_batches
+                .par_iter()
+                .map(|batch| -> std::result::Result<Option<RecordBatch>, SubstraitError> {
+                    let mask = filter_project::evaluate_predicate(batch, predicate)
+                        .map_err(|e| SubstraitError::Internal(format!("filter error: {}", e)))?;
+                    let filtered = filter_project::filter_batch(batch, &mask)
+                        .map_err(|e| SubstraitError::Internal(format!("filter error: {}", e)))?;
+                    if filtered.num_rows() > 0 {
+                        Ok(Some(filtered))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .collect();
+
             let mut output = Vec::new();
-            for batch in &child_batches {
-                let mask = filter_project::evaluate_predicate(batch, predicate)?;
-                let filtered = filter_project::filter_batch(batch, &mask)?;
-                if filtered.num_rows() > 0 {
-                    output.push(filtered);
+            for result in results {
+                if let Some(batch) = result? {
+                    output.push(batch);
                 }
             }
             Ok(output)
@@ -85,13 +94,24 @@ fn execute_node(
 
         PlanNode::Project { input, columns, expressions } => {
             let child_batches = execute_node(input, tables)?;
+
+            // Parallel project
+            let results: Vec<std::result::Result<RecordBatch, SubstraitError>> = child_batches
+                .par_iter()
+                .map(|batch| -> std::result::Result<RecordBatch, SubstraitError> {
+                    if expressions.is_empty() {
+                        filter_project::project_batch(batch, columns)
+                            .map_err(|e| SubstraitError::Internal(format!("project error: {}", e)))
+                    } else {
+                        filter_project::project_batch_with_exprs(batch, columns, expressions)
+                            .map_err(|e| SubstraitError::Internal(format!("project error: {}", e)))
+                    }
+                })
+                .collect();
+
             let mut output = Vec::new();
-            for batch in &child_batches {
-                if expressions.is_empty() {
-                    output.push(filter_project::project_batch(batch, columns)?);
-                } else {
-                    output.push(filter_project::project_batch_with_exprs(batch, columns, expressions)?);
-                }
+            for result in results {
+                output.push(result?);
             }
             Ok(output)
         }
@@ -110,7 +130,6 @@ fn execute_node(
                 group_by: group_by.clone(),
                 aggregates: aggregates.clone(),
             };
-            // Use chunked aggregation — processes batches without concatenating
             let result = hash_aggregate::hash_aggregate_batches(&child_batches, &config)?;
             Ok(vec![result])
         }
@@ -129,18 +148,34 @@ fn execute_node(
                 return Ok(vec![]);
             }
 
-            let left_merged =
-                concat_batches(&left_batches[0].schema(), &left_batches)?;
-            let right_merged =
-                concat_batches(&right_batches[0].schema(), &right_batches)?;
-
             let config = hash_join::HashJoinConfig {
                 join_type: *join_type,
                 probe_keys: left_keys.clone(),
                 build_keys: right_keys.clone(),
             };
-            let result = hash_join::hash_join(&left_merged, &right_merged, &config)?;
-            Ok(vec![result])
+
+            // For Inner/Left/Semi/Anti joins: use parallel chunked probing.
+            // Build side (right) is typically smaller; concat it once.
+            // Probe side (left) stays as multiple batches for parallel processing.
+            match join_type {
+                hash_join::JoinType::Inner
+                | hash_join::JoinType::Left
+                | hash_join::JoinType::LeftSemi
+                | hash_join::JoinType::LeftAnti => {
+                    let right_merged =
+                        concat_batches(&right_batches[0].schema(), &right_batches)?;
+                    hash_join::hash_join_probe_chunked(&left_batches, &right_merged, &config)
+                }
+                _ => {
+                    // Right/Full joins: fall back to single-batch path
+                    let left_merged =
+                        concat_batches(&left_batches[0].schema(), &left_batches)?;
+                    let right_merged =
+                        concat_batches(&right_batches[0].schema(), &right_batches)?;
+                    let result = hash_join::hash_join(&left_merged, &right_merged, &config)?;
+                    Ok(vec![result])
+                }
+            }
         }
 
         PlanNode::Sort {
@@ -152,18 +187,49 @@ fn execute_node(
             if child_batches.is_empty() {
                 return Ok(vec![]);
             }
-            let merged = concat_batches(&child_batches[0].schema(), &child_batches)?;
 
-            let result = if let Some(lim) = limit {
-                sort::sort_batch_limit(&merged, sort_keys, *lim)?
+            if let Some(lim) = limit {
+                // Streaming top-N: sort each batch with limit in parallel,
+                // then merge-sort the partial results. This avoids concatenating
+                // all 150M+ rows just to keep the top N.
+                let partial_results: Vec<std::result::Result<RecordBatch, SubstraitError>> = child_batches
+                    .par_iter()
+                    .map(|batch| {
+                        if batch.num_rows() == 0 {
+                            return Ok(batch.clone());
+                        }
+                        sort::sort_batch_limit(batch, sort_keys, *lim)
+                            .map_err(|e| SubstraitError::Internal(format!("sort error: {}", e)))
+                    })
+                    .collect();
+
+                let mut sorted_partials: Vec<RecordBatch> = Vec::new();
+                for result in partial_results {
+                    let batch = result?;
+                    if batch.num_rows() > 0 {
+                        sorted_partials.push(batch);
+                    }
+                }
+
+                if sorted_partials.is_empty() {
+                    return Ok(vec![]);
+                }
+
+                // Merge all partials and do a final sort with limit
+                let schema = sorted_partials[0].schema();
+                let merged = concat_batches(&schema, &sorted_partials)?;
+                let result = sort::sort_batch_limit(&merged, sort_keys, *lim)
+                    .map_err(|e| SubstraitError::Internal(format!("sort error: {}", e)))?;
+                Ok(vec![result])
             } else {
-                sort::sort_batch(&merged, sort_keys)?
-            };
-            Ok(vec![result])
+                let merged = concat_batches(&child_batches[0].schema(), &child_batches)?;
+                let result = sort::sort_batch(&merged, sort_keys)
+                    .map_err(|e| SubstraitError::Internal(format!("sort error: {}", e)))?;
+                Ok(vec![result])
+            }
         }
 
         PlanNode::Exchange { input, .. } => {
-            // Exchange is handled at the Flight layer, not in-process
             execute_node(input, tables)
         }
     }

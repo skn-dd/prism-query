@@ -183,9 +183,10 @@ pub fn orders_schema() -> Arc<Schema> {
 
 // ─── Parquet writers ─────────────────────────────────────────────────
 
-/// Write lineitem data as a sorted Parquet file.
+/// Write lineitem data as sorted Parquet files for parallel I/O.
 /// Sorts by (l_discount, l_quantity) so row groups have tight min/max ranges
 /// for effective row group skipping on filter queries.
+/// Splits into multiple files so rayon can read them in parallel.
 pub fn write_lineitem_parquet(
     output_dir: &Path,
     row_count: usize,
@@ -193,7 +194,15 @@ pub fn write_lineitem_parquet(
     row_group_size: usize,
 ) -> anyhow::Result<PathBuf> {
     fs::create_dir_all(output_dir)?;
-    let file_path = output_dir.join("lineitem.parquet");
+
+    // Remove old files
+    if let Ok(entries) = fs::read_dir(output_dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("parquet") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
 
     // Generate data in memory, then sort
     let batches = make_lineitem_shard(row_count, row_offset, row_count.min(5_000_000));
@@ -219,30 +228,42 @@ pub fn write_lineitem_parquet(
         .collect();
     let sorted = RecordBatch::try_new(schema.clone(), sorted_columns)?;
 
-    // Write as Parquet with configured row group size
+    // Write as multiple UNCOMPRESSED Parquet files for parallel I/O
+    let num_files = 8; // match RAYON_NUM_THREADS for optimal parallelism
+    let rows_per_file = (sorted.num_rows() + num_files - 1) / num_files;
+
     let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(Compression::UNCOMPRESSED)
         .set_max_row_group_size(row_group_size)
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
         .build();
 
-    let file = fs::File::create(&file_path)?;
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&sorted)?;
-    writer.close()?;
+    for file_idx in 0..num_files {
+        let start = file_idx * rows_per_file;
+        if start >= sorted.num_rows() { break; }
+        let len = rows_per_file.min(sorted.num_rows() - start);
+        let slice = sorted.slice(start, len);
+
+        let file_path = output_dir.join(format!("lineitem_{:02}.parquet", file_idx));
+        let file = fs::File::create(&file_path)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+        writer.write(&slice)?;
+        writer.close()?;
+    }
 
     tracing::info!(
-        "Wrote {} rows to {:?} (sorted by l_discount, l_quantity, row_group_size={})",
+        "Wrote {} rows to {:?} ({} files, sorted, uncompressed, rg_size={})",
         row_count,
-        file_path,
+        output_dir,
+        num_files,
         row_group_size,
     );
 
-    Ok(file_path)
+    Ok(output_dir.to_path_buf())
 }
 
-/// Write orders data as a sorted Parquet file.
-/// Sorts by (o_orderstatus) for predicate pushdown on status filters.
+/// Write orders data as sorted Parquet files for parallel I/O.
+/// Sorts by (o_orderdate) for row group skipping on date range filters (join query).
 pub fn write_orders_parquet(
     output_dir: &Path,
     row_count: usize,
@@ -250,15 +271,23 @@ pub fn write_orders_parquet(
     row_group_size: usize,
 ) -> anyhow::Result<PathBuf> {
     fs::create_dir_all(output_dir)?;
-    let file_path = output_dir.join("orders.parquet");
+
+    // Remove old files
+    if let Ok(entries) = fs::read_dir(output_dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("parquet") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
 
     let batches = make_orders_shard(row_count, row_offset, row_count.min(5_000_000));
     let schema = orders_schema();
     let all_data = concat_batches(&schema, &batches)?;
 
-    // Sort by o_orderstatus (col 2)
+    // Sort by o_orderdate (col 5) for row group skipping on date range filters
     let sort_cols = vec![arrow::compute::SortColumn {
-        values: all_data.column(2).clone(),
+        values: all_data.column(5).clone(),
         options: Some(SortOptions::default()),
     }];
     let indices = arrow::compute::lexsort_to_indices(&sort_cols, None)?;
@@ -269,23 +298,35 @@ pub fn write_orders_parquet(
         .collect();
     let sorted = RecordBatch::try_new(schema.clone(), sorted_columns)?;
 
+    let num_files = 4; // fewer files for smaller table
+    let rows_per_file = (sorted.num_rows() + num_files - 1) / num_files;
+
     let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(Compression::UNCOMPRESSED)
         .set_max_row_group_size(row_group_size)
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
         .build();
 
-    let file = fs::File::create(&file_path)?;
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&sorted)?;
-    writer.close()?;
+    for file_idx in 0..num_files {
+        let start = file_idx * rows_per_file;
+        if start >= sorted.num_rows() { break; }
+        let len = rows_per_file.min(sorted.num_rows() - start);
+        let slice = sorted.slice(start, len);
+
+        let file_path = output_dir.join(format!("orders_{:02}.parquet", file_idx));
+        let file = fs::File::create(&file_path)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+        writer.write(&slice)?;
+        writer.close()?;
+    }
 
     tracing::info!(
-        "Wrote {} rows to {:?} (sorted by o_orderstatus, row_group_size={})",
+        "Wrote {} rows to {:?} ({} files, sorted, uncompressed, rg_size={})",
         row_count,
-        file_path,
+        output_dir,
+        num_files,
         row_group_size,
     );
 
-    Ok(file_path)
+    Ok(output_dir.to_path_buf())
 }

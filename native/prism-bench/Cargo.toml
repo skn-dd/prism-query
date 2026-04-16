@@ -29,3 +29,4 @@ tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 parquet = { workspace = true }
+libc = "0.2"

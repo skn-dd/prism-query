@@ -18,8 +18,10 @@ import io.trino.spi.predicate.ValueSet;
 import io.trino.spi.type.*;
 
 import java.util.*;
+import java.util.logging.Logger;
 
 public class PrismMetadata implements ConnectorMetadata {
+    private static final Logger LOG = Logger.getLogger(PrismMetadata.class.getName());
 
     // TPC-H table definitions matching datagen.rs schemas
     private static final Map<String, List<ColumnDef>> TPCH_TABLES = Map.of(
@@ -351,12 +353,19 @@ public class PrismMetadata implements ConnectorMetadata {
             List<ConnectorExpression> projections,
             Map<String, ColumnHandle> assignments) {
         PrismTableHandle handle = (PrismTableHandle) table;
+        LOG.info("applyProjection called: table=" + handle.getTableName() +
+                 ", projections=" + projections.size() +
+                 ", assignments=" + assignments.keySet() +
+                 ", hasPlan=" + handle.getPushedPlan().isPresent() +
+                 ", planType=" + handle.getPushedPlan().map(p -> p.getClass().getSimpleName()).orElse("none"));
 
         List<ConnectorExpression> outputProjections = new ArrayList<>();
         Map<String, Assignment> outputAssignmentMap = new LinkedHashMap<>();
         List<PrismPlanNode.ScalarExprNode> computedExprs = new ArrayList<>();
 
-        int baseColumnCount = getTableColumns(handle.getTableName()).size();
+        PrismPlanNode currentPlan = handle.getPushedPlan()
+                .orElseGet(() -> buildFullScan(handle.getTableName()));
+        int baseColumnCount = computePlanColumnCount(currentPlan, handle.getTableName());
         boolean hasComputedExprs = false;
 
         for (ConnectorExpression projection : projections) {
@@ -389,13 +398,77 @@ public class PrismMetadata implements ConnectorMetadata {
         }
 
         if (!hasComputedExprs) {
+            // Column-only projection: create a column-pruning Project if it reduces columns.
+            // This absorbs Trino's ProjectNode so PushAggregationIntoTableScan can fire.
+            // Convergence: only accept if selectCols.size() < currentOutputCols.
+            if (handle.getPushedPlan().isPresent()) {
+                List<Integer> selectCols = new ArrayList<>();
+                Map<Integer, Integer> remap = new HashMap<>();
+                for (ConnectorExpression proj : projections) {
+                    if (proj instanceof Variable var) {
+                        ColumnHandle ch = assignments.get(var.getName());
+                        if (ch instanceof PrismColumnHandle pch) {
+                            if (!remap.containsKey(pch.getColumnIndex())) {
+                                remap.put(pch.getColumnIndex(), selectCols.size());
+                                selectCols.add(pch.getColumnIndex());
+                            }
+                        }
+                    }
+                }
+                int currentOutputCols = computePlanColumnCount(currentPlan, handle.getTableName());
+                LOG.info("applyProjection: column-only pruning check: selectCols=" + selectCols.size() +
+                         " vs currentOutputCols=" + currentOutputCols + ", selectCols=" + selectCols);
+                if (selectCols.size() < currentOutputCols) {
+                    PrismPlanNode projectPlan = new PrismPlanNode.Project(currentPlan, selectCols);
+                    PrismTableHandle newHandle = handle.withPushedPlan(projectPlan);
+                    // Remap output assignments to new 0-based positions.
+                    // Deduplicate by new column index: if two variables reference the same
+                    // column, keep one assignment and rewrite outputProjections to reference it.
+                    Map<Integer, String> newIdxToVarName = new LinkedHashMap<>();
+                    Map<String, Assignment> remapped = new LinkedHashMap<>();
+                    for (var entry : outputAssignmentMap.entrySet()) {
+                        Assignment a = entry.getValue();
+                        PrismColumnHandle oldCol = (PrismColumnHandle) a.getColumn();
+                        Integer newIdx = remap.get(oldCol.getColumnIndex());
+                        if (newIdx != null) {
+                            if (!newIdxToVarName.containsKey(newIdx)) {
+                                newIdxToVarName.put(newIdx, a.getVariable());
+                                PrismColumnHandle newCol = new PrismColumnHandle(oldCol.getColumnName(), newIdx, oldCol.getType());
+                                remapped.put(entry.getKey(), new Assignment(a.getVariable(), newCol, a.getType()));
+                            }
+                        }
+                    }
+                    // Rewrite outputProjections: for each projection, use the canonical variable
+                    // name for its column index
+                    List<ConnectorExpression> rewrittenProjections = new ArrayList<>();
+                    for (ConnectorExpression proj : projections) {
+                        if (proj instanceof Variable var) {
+                            ColumnHandle ch = assignments.get(var.getName());
+                            if (ch instanceof PrismColumnHandle pch) {
+                                Integer newIdx = remap.get(pch.getColumnIndex());
+                                String canonicalName = newIdxToVarName.get(newIdx);
+                                if (canonicalName != null) {
+                                    rewrittenProjections.add(new Variable(canonicalName, var.getType()));
+                                    continue;
+                                }
+                            }
+                        }
+                        rewrittenProjections.add(proj);
+                    }
+                    LOG.info("applyProjection: created column-pruning Project " + selectCols + " -> " + remapped.keySet());
+                    return Optional.of(new ProjectionApplicationResult<>(
+                            newHandle,
+                            rewrittenProjections,
+                            new ArrayList<>(remapped.values()),
+                            false));
+                }
+                // selectCols >= currentOutputCols — no pruning possible, converge
+                LOG.info("applyProjection: no pruning possible, returning empty to converge");
+            }
             return Optional.empty();
         }
 
         // Build Project plan: passthrough all base columns + computed expressions
-        PrismPlanNode currentPlan = handle.getPushedPlan()
-                .orElseGet(() -> buildFullScan(handle.getTableName()));
-
         List<Integer> passthrough = new ArrayList<>();
         for (int i = 0; i < baseColumnCount; i++) {
             passthrough.add(i);
@@ -404,12 +477,36 @@ public class PrismMetadata implements ConnectorMetadata {
         PrismTableHandle newHandle = handle.withPushedPlan(projectPlan);
 
         // Include all base columns in output assignments (subsequent pushdowns need them)
-        List<ColumnDef> defs = getTableColumns(handle.getTableName());
-        for (int i = 0; i < defs.size(); i++) {
-            ColumnDef def = defs.get(i);
-            outputAssignmentMap.putIfAbsent(def.name(),
-                    new Assignment(def.name(), new PrismColumnHandle(def.name(), i, def.type()), def.type()));
+        // Only when the plan is a bare Join or single-table Scan — NOT when it's already
+        // a column-pruned Project (which would have wrong index mappings)
+        if (currentPlan instanceof PrismPlanNode.Join joinNode) {
+            String leftTable = findScanTableName(joinNode.left());
+            String rightTable = findScanTableName(joinNode.right());
+            if (leftTable != null) {
+                for (int i = 0; i < getTableColumns(leftTable).size(); i++) {
+                    ColumnDef def = getTableColumns(leftTable).get(i);
+                    outputAssignmentMap.putIfAbsent(def.name(),
+                            new Assignment(def.name(), new PrismColumnHandle(def.name(), i, def.type()), def.type()));
+                }
+            }
+            if (rightTable != null) {
+                int offset = leftTable != null ? getTableColumns(leftTable).size() : 0;
+                for (int i = 0; i < getTableColumns(rightTable).size(); i++) {
+                    ColumnDef def = getTableColumns(rightTable).get(i);
+                    outputAssignmentMap.putIfAbsent(def.name(),
+                            new Assignment(def.name(), new PrismColumnHandle(def.name(), offset + i, def.type()), def.type()));
+                }
+            }
+        } else if (findJoinInPlan(currentPlan) == null) {
+            // Single-table plan (no join underneath)
+            List<ColumnDef> defs = getTableColumns(handle.getTableName());
+            for (int i = 0; i < defs.size(); i++) {
+                ColumnDef def = defs.get(i);
+                outputAssignmentMap.putIfAbsent(def.name(),
+                        new Assignment(def.name(), new PrismColumnHandle(def.name(), i, def.type()), def.type()));
+            }
         }
+        // For column-pruned plans over joins, skip — projected columns already in outputAssignmentMap
 
         return Optional.of(new ProjectionApplicationResult<>(
                 newHandle,
@@ -429,6 +526,12 @@ public class PrismMetadata implements ConnectorMetadata {
             Map<String, ColumnHandle> assignments,
             List<List<ColumnHandle>> groupingSets) {
         PrismTableHandle handle = (PrismTableHandle) table;
+        LOG.info("applyAggregation called: table=" + handle.getTableName() +
+                 ", aggregates=" + aggregates.size() +
+                 ", assignments=" + assignments.keySet() +
+                 ", groupingSets=" + groupingSets.size() +
+                 ", hasPlan=" + handle.getPushedPlan().isPresent() +
+                 ", planType=" + handle.getPushedPlan().map(p -> p.getClass().getSimpleName()).orElse("none"));
 
         // Only handle single grouping set (no ROLLUP/CUBE)
         if (groupingSets.size() != 1) {
@@ -447,17 +550,29 @@ public class PrismMetadata implements ConnectorMetadata {
         }
         groupByColumns = dedupedGroupBy;
 
-        // Convert group-by to column indices
+        // Resolve current plan and compute output column count
+        PrismPlanNode currentPlan = handle.getPushedPlan()
+                .orElseGet(() -> buildFullScan(handle.getTableName()));
+        int baseColumnCount = computePlanColumnCount(currentPlan, handle.getTableName());
+        // Column handles already have correct offset indices from applyJoin
+        Map<String, ColumnHandle> effectiveAssignments = assignments;
+
+        // Convert group-by to column indices (using remapped handles)
         List<Integer> groupByIndices = new ArrayList<>();
         for (ColumnHandle ch : groupByColumns) {
             PrismColumnHandle col = (PrismColumnHandle) ch;
-            groupByIndices.add(col.getColumnIndex());
+            // Find remapped handle if available
+            ColumnHandle remapped = effectiveAssignments.get(col.getColumnName());
+            if (remapped instanceof PrismColumnHandle rch) {
+                groupByIndices.add(rch.getColumnIndex());
+            } else {
+                groupByIndices.add(col.getColumnIndex());
+            }
         }
 
         // Convert aggregates — handle both simple column refs and expression args
         List<PrismPlanNode.AggregateExpr> aggExprs = new ArrayList<>();
         List<PrismPlanNode.ScalarExprNode> computedExprs = new ArrayList<>();
-        int baseColumnCount = getTableColumns(handle.getTableName()).size();
 
         for (AggregateFunction agg : aggregates) {
             // Skip aggregates with filters or ordering (can't push those down)
@@ -475,12 +590,12 @@ public class PrismMetadata implements ConnectorMetadata {
             if (!agg.getArguments().isEmpty()) {
                 ConnectorExpression input = agg.getArguments().get(0);
                 if (input instanceof Variable var) {
-                    ColumnHandle ch = assignments.get(var.getName());
+                    ColumnHandle ch = effectiveAssignments.get(var.getName());
                     if (ch instanceof PrismColumnHandle pch) {
                         inputCol = pch.getColumnIndex();
                     }
                 } else if (input instanceof Call call) {
-                    PrismPlanNode.ScalarExprNode exprNode = convertCallExpression(call, assignments);
+                    PrismPlanNode.ScalarExprNode exprNode = convertCallExpression(call, effectiveAssignments);
                     if (exprNode == null) {
                         return Optional.empty();
                     }
@@ -495,8 +610,6 @@ public class PrismMetadata implements ConnectorMetadata {
         }
 
         // Build plan: if computed expressions exist, insert Project before Aggregate
-        PrismPlanNode currentPlan = handle.getPushedPlan()
-                .orElseGet(() -> buildFullScan(handle.getTableName()));
         if (!computedExprs.isEmpty()) {
             List<Integer> passthrough = new ArrayList<>();
             for (int i = 0; i < baseColumnCount; i++) passthrough.add(i);
@@ -511,11 +624,15 @@ public class PrismMetadata implements ConnectorMetadata {
         List<Assignment> outputAssignments = new ArrayList<>();
         Map<ColumnHandle, ColumnHandle> groupingColumnMapping = new LinkedHashMap<>();
 
-        // Group-by columns come first in the output
+        // Group-by columns come first in the output.
+        // Output handles MUST differ from input handles (ImmutableBiMap in Trino's
+        // PushAggregationIntoTableScan combines both in a BiMap requiring unique values).
+        // Use "_gb_" prefix + output index to ensure distinctness.
         int outputIdx = 0;
         for (ColumnHandle ch : groupByColumns) {
             PrismColumnHandle col = (PrismColumnHandle) ch;
-            PrismColumnHandle outputCol = new PrismColumnHandle(col.getColumnName(), outputIdx, col.getType());
+            String outputName = "_gb_" + col.getColumnName();
+            PrismColumnHandle outputCol = new PrismColumnHandle(outputName, outputIdx, col.getType());
             outputAssignments.add(new Assignment(col.getColumnName(), outputCol, col.getType()));
             groupingColumnMapping.put(outputCol, col);
             outputIdx++;
@@ -566,7 +683,13 @@ public class PrismMetadata implements ConnectorMetadata {
             Map<String, ColumnHandle> assignments) {
         PrismTableHandle handle = (PrismTableHandle) table;
 
+        LOG.info("applyTopN called: topNCount=" + topNCount +
+                 ", sortItems=" + sortItems.size() +
+                 ", assignments=" + assignments.keySet() +
+                 ", table=" + handle.getTableName());
+
         if (topNCount <= 0 || topNCount > Integer.MAX_VALUE || sortItems.isEmpty()) {
+            LOG.info("applyTopN: rejected (invalid count or empty sortItems)");
             return Optional.empty();
         }
 
@@ -574,7 +697,10 @@ public class PrismMetadata implements ConnectorMetadata {
         for (SortItem item : sortItems) {
             String colName = item.getName();
             ColumnHandle ch = assignments.get(colName);
+            LOG.info("applyTopN: sortItem name='" + colName + "', found=" + (ch != null) +
+                     ", isPrismCol=" + (ch instanceof PrismColumnHandle));
             if (!(ch instanceof PrismColumnHandle col)) {
+                LOG.info("applyTopN: rejected (column '" + colName + "' not found or not PrismColumnHandle)");
                 return Optional.empty();
             }
             String direction = item.getSortOrder().isAscending() ? "ASC" : "DESC";
@@ -584,9 +710,34 @@ public class PrismMetadata implements ConnectorMetadata {
 
         PrismPlanNode currentPlan = handle.getPushedPlan()
                 .orElseGet(() -> buildFullScan(handle.getTableName()));
-        PrismPlanNode sortPlan = new PrismPlanNode.Sort(currentPlan, sortKeys, topNCount);
+
+        // Add column pruning: only read columns needed by output + sort keys
+        // Collect all needed column indices (assignments = output, sortKeys = sort)
+        Set<Integer> neededCols = new TreeSet<>();
+        for (ColumnHandle ch : assignments.values()) {
+            if (ch instanceof PrismColumnHandle col) {
+                neededCols.add(col.getColumnIndex());
+            }
+        }
+        for (PrismPlanNode.SortKeyDef key : sortKeys) {
+            neededCols.add(key.columnIndex());
+        }
+        List<Integer> projCols = new ArrayList<>(neededCols);
+
+        // Add Project to prune columns, then remap sort keys to projected positions
+        PrismPlanNode projectPlan = new PrismPlanNode.Project(currentPlan, projCols);
+
+        List<PrismPlanNode.SortKeyDef> remappedKeys = new ArrayList<>();
+        for (PrismPlanNode.SortKeyDef key : sortKeys) {
+            int newIdx = projCols.indexOf(key.columnIndex());
+            remappedKeys.add(new PrismPlanNode.SortKeyDef(newIdx, key.direction(), key.nullOrdering()));
+        }
+
+        PrismPlanNode sortPlan = new PrismPlanNode.Sort(projectPlan, remappedKeys, topNCount);
         PrismTableHandle newHandle = handle.withPushedPlan(sortPlan);
 
+        LOG.info("applyTopN: SUCCESS - pushed Sort with " + remappedKeys.size() + " keys, limit=" + topNCount +
+                 ", projCols=" + projCols);
         return Optional.of(new TopNApplicationResult<>(newHandle, true, false));
     }
 
@@ -604,6 +755,25 @@ public class PrismMetadata implements ConnectorMetadata {
             JoinStatistics statistics) {
         PrismTableHandle leftHandle = (PrismTableHandle) left;
         PrismTableHandle rightHandle = (PrismTableHandle) right;
+
+        LOG.info("applyJoin called: leftTable=" + leftHandle.getTableName() +
+                 ", rightTable=" + rightHandle.getTableName() +
+                 ", leftAssignments.keys=" + leftAssignments.keySet() +
+                 ", rightAssignments.keys=" + rightAssignments.keySet());
+
+        // Log exact handle details for debugging
+        for (var entry : leftAssignments.entrySet()) {
+            PrismColumnHandle ch = (PrismColumnHandle) entry.getValue();
+            LOG.info("  leftAssignment: key='" + entry.getKey() + "' -> handle(name=" + ch.getColumnName() +
+                     ", idx=" + ch.getColumnIndex() + ", type=" + ch.getType() +
+                     ", class=" + ch.getClass().getName() + ", hash=" + ch.hashCode() + ")");
+        }
+        for (var entry : rightAssignments.entrySet()) {
+            PrismColumnHandle ch = (PrismColumnHandle) entry.getValue();
+            LOG.info("  rightAssignment: key='" + entry.getKey() + "' -> handle(name=" + ch.getColumnName() +
+                     ", idx=" + ch.getColumnIndex() + ", type=" + ch.getType() +
+                     ", class=" + ch.getClass().getName() + ", hash=" + ch.hashCode() + ")");
+        }
 
         // Extract equi-join keys from the join condition
         List<Integer> leftKeys = new ArrayList<>();
@@ -639,23 +809,29 @@ public class PrismMetadata implements ConnectorMetadata {
                 leftHandle.getSchemaName(), leftHandle.getTableName())
                 .withPushedPlan(joinPlan);
 
-        // Build output column mappings: new output handle -> original input handle
+        // Build output column mappings. Trino validates that the mapping KEYS
+        // match getColumnHandles(session, table).values() exactly — so keys must
+        // use original table column indices, NOT sequential output indices.
         Map<ColumnHandle, ColumnHandle> leftColumnMapping = new LinkedHashMap<>();
         Map<ColumnHandle, ColumnHandle> rightColumnMapping = new LinkedHashMap<>();
-        int outputIdx = 0;
 
-        // Left side columns
-        for (var entry : leftAssignments.entrySet()) {
-            PrismColumnHandle col = (PrismColumnHandle) entry.getValue();
-            PrismColumnHandle outputCol = new PrismColumnHandle(entry.getKey(), outputIdx++, col.getType());
-            leftColumnMapping.put(outputCol, col);
+        // Left side: identity mapping (old handle → old handle)
+        List<ColumnDef> leftDefs = getTableColumns(leftHandle.getTableName());
+        for (int i = 0; i < leftDefs.size(); i++) {
+            ColumnDef def = leftDefs.get(i);
+            PrismColumnHandle col = new PrismColumnHandle(def.name(), i, def.type());
+            leftColumnMapping.put(col, col);
         }
 
-        // Right side columns
-        for (var entry : rightAssignments.entrySet()) {
-            PrismColumnHandle col = (PrismColumnHandle) entry.getValue();
-            PrismColumnHandle outputCol = new PrismColumnHandle(entry.getKey(), outputIdx++, col.getType());
-            rightColumnMapping.put(outputCol, col);
+        // Right side: old handle (key, idx 0..N) → new handle (value, idx leftCount+0..N)
+        // Subsequent pushdowns see correct positions in join output
+        List<ColumnDef> rightDefs = getTableColumns(rightHandle.getTableName());
+        int leftColCount = leftDefs.size();
+        for (int i = 0; i < rightDefs.size(); i++) {
+            ColumnDef def = rightDefs.get(i);
+            PrismColumnHandle oldCol = new PrismColumnHandle(def.name(), i, def.type());
+            PrismColumnHandle newCol = new PrismColumnHandle(def.name(), leftColCount + i, def.type());
+            rightColumnMapping.put(oldCol, newCol);
         }
 
         return Optional.of(new JoinApplicationResult<>(
@@ -791,6 +967,52 @@ public class PrismMetadata implements ConnectorMetadata {
     }
 
     // ===== Helper =====
+
+    /** Find a Join node in the plan tree (looking through Filter, Project, Aggregate, Sort). */
+    private PrismPlanNode.Join findJoinInPlan(PrismPlanNode node) {
+        if (node instanceof PrismPlanNode.Join join) return join;
+        if (node instanceof PrismPlanNode.Filter f) return findJoinInPlan(f.input());
+        if (node instanceof PrismPlanNode.Project p) return findJoinInPlan(p.input());
+        if (node instanceof PrismPlanNode.Aggregate a) return findJoinInPlan(a.input());
+        if (node instanceof PrismPlanNode.Sort s) return findJoinInPlan(s.input());
+        return null;
+    }
+
+    /** Compute the output column count for a plan node. */
+    private int computePlanColumnCount(PrismPlanNode plan, String tableName) {
+        if (plan instanceof PrismPlanNode.Join join) {
+            String leftTable = findScanTableName(join.left());
+            String rightTable = findScanTableName(join.right());
+            int leftCols = leftTable != null ? getTableColumns(leftTable).size() : 0;
+            int rightCols = rightTable != null ? getTableColumns(rightTable).size() : 0;
+            return leftCols + rightCols;
+        }
+        if (plan instanceof PrismPlanNode.Project project) {
+            return project.columnIndices().size()
+                    + (project.expressions() != null ? project.expressions().size() : 0);
+        }
+        if (plan instanceof PrismPlanNode.Aggregate agg) {
+            return agg.groupBy().size() + agg.aggregates().size();
+        }
+        if (plan instanceof PrismPlanNode.Sort sort) {
+            return computePlanColumnCount(sort.input(), tableName);
+        }
+        if (plan instanceof PrismPlanNode.Filter filter) {
+            return computePlanColumnCount(filter.input(), tableName);
+        }
+        List<ColumnDef> defs = getTableColumns(tableName);
+        return defs != null ? defs.size() : 0;
+    }
+
+    /** Walk a plan tree to find the table name from the nearest Scan node. */
+    private String findScanTableName(PrismPlanNode node) {
+        if (node instanceof PrismPlanNode.Scan scan) return scan.tableName();
+        if (node instanceof PrismPlanNode.Filter f) return findScanTableName(f.input());
+        if (node instanceof PrismPlanNode.Project p) return findScanTableName(p.input());
+        if (node instanceof PrismPlanNode.Aggregate a) return findScanTableName(a.input());
+        if (node instanceof PrismPlanNode.Sort s) return findScanTableName(s.input());
+        return null;
+    }
 
     PrismPlanNode buildFullScan(String tableName) {
         List<ColumnDef> defs = TPCH_TABLES.get(tableName);
