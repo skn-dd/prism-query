@@ -1185,7 +1185,7 @@ dependencies = [
  "log",
  "object_store",
  "parking_lot",
- "parquet",
+ "parquet 54.3.1",
  "rand",
  "regex",
  "sqlparser",
@@ -1255,7 +1255,7 @@ dependencies = [
  "libc",
  "log",
  "object_store",
- "parquet",
+ "parquet 54.3.1",
  "paste",
  "recursive",
  "sqlparser",
@@ -2745,6 +2745,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet"
+version = "55.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b17da4150748086bd43352bc77372efa9b6e3dbd06a04831d2a98c041c225cfa"
+dependencies = [
+ "ahash",
+ "arrow-array 55.2.0",
+ "arrow-buffer 55.2.0",
+ "arrow-cast 55.2.0",
+ "arrow-data 55.2.0",
+ "arrow-ipc 55.2.0",
+ "arrow-schema 55.2.0",
+ "arrow-select 55.2.0",
+ "base64",
+ "bytes",
+ "chrono",
+ "half",
+ "hashbrown 0.15.5",
+ "num",
+ "num-bigint",
+ "paste",
+ "seq-macro",
+ "snap",
+ "thrift",
+ "twox-hash 2.1.2",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2885,6 +2913,8 @@ dependencies = [
  "base64",
  "clap",
  "futures",
+ "libc",
+ "parquet 55.2.0",
  "prism-executor",
  "prism-flight",
  "prism-substrait",
@@ -2913,6 +2943,8 @@ dependencies = [
  "criterion",
  "datafusion-common",
  "datafusion-physical-expr",
+ "parquet 55.2.0",
+ "rayon",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -2985,6 +3017,7 @@ dependencies = [
  "prism-executor",
  "prost",
  "prost-types",
+ "rayon",
  "substrait",
  "thiserror 2.0.18",
  "tracing",

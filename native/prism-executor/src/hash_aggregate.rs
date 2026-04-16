@@ -18,6 +18,62 @@ use rayon::prelude::*;
 
 use crate::Result;
 
+/// Fast non-cryptographic hasher (FxHash algorithm).
+/// ~3-5x faster than DefaultHasher (SipHash) for integer keys — appropriate
+/// for internal group-key hashing where cryptographic security is not required.
+struct FxHasher {
+    state: u64,
+}
+
+impl FxHasher {
+    #[inline(always)]
+    fn new() -> Self {
+        Self { state: 0 }
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.state
+    }
+
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            let word = u64::from_le_bytes(buf);
+            self.state = self.state.wrapping_mul(0x517cc1b727220a95).wrapping_add(word);
+        }
+    }
+
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        self.state = self.state.wrapping_mul(0x517cc1b727220a95).wrapping_add(i);
+    }
+
+    #[inline(always)]
+    fn write_i64(&mut self, i: i64) {
+        self.write_u64(i as u64);
+    }
+
+    #[inline(always)]
+    fn write_i32(&mut self, i: i32) {
+        self.write_u64(i as u64);
+    }
+
+    #[inline(always)]
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64);
+    }
+
+    #[inline(always)]
+    fn write_u8(&mut self, i: u8) {
+        self.write_u64(i as u64);
+    }
+}
+
 /// Supported aggregate functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunc {
@@ -366,7 +422,7 @@ fn cast_to_f64(array: &ArrayRef) -> Result<ArrayRef> {
 }
 
 fn hash_group_keys(batch: &RecordBatch, key_cols: &[usize], row: usize) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = FxHasher::new();
     for &col_idx in key_cols {
         let col = batch.column(col_idx);
         hash_array_value(col.as_ref(), row, &mut hasher);
