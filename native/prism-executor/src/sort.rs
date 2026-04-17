@@ -3,7 +3,9 @@
 //! Replaces Trino's `OrderByOperator`. Uses Arrow's built-in sort kernels.
 
 use arrow::compute::{self, SortColumn, SortOptions};
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{Array, Float64Array, RecordBatch, UInt32Array};
+use arrow_schema::DataType;
+use rayon::prelude::*;
 
 use crate::Result;
 
@@ -83,6 +85,143 @@ pub fn merge_sorted(
 ) -> Result<RecordBatch> {
     let merged = compute::concat_batches(&left.schema(), &[left.clone(), right.clone()])?;
     sort_batch(&merged, sort_keys)
+}
+
+/// Heap-based Top-N for a single sort key over many batches. Avoids Arrow's
+/// sort kernel by maintaining a fixed-size min-heap (scanned via argmin) while
+/// streaming over primitive values. Much faster than per-batch `sort_batch_limit`
+/// + merge when limit is small.
+///
+/// Currently specialized for Float64 descending (the common TopN benchmark case).
+/// Returns Ok(None) if not specialized — caller should fall back.
+pub fn topn_single_col(
+    batches: &[RecordBatch],
+    sort_key: &SortKey,
+    limit: usize,
+) -> Result<Option<RecordBatch>> {
+    if batches.is_empty() || limit == 0 {
+        return Ok(None);
+    }
+    let schema = batches[0].schema();
+    let col_idx = sort_key.column;
+    let first_col = batches[0].column(col_idx);
+    let is_desc = sort_key.direction == SortDirection::Desc;
+
+    // Only specialized for Float64 DESC with NULLS LAST for now.
+    if first_col.data_type() != &DataType::Float64 || !is_desc {
+        return Ok(None);
+    }
+
+    // Phase 1 — per-batch parallel heap scan
+    let per_batch: Vec<Vec<(f64, u32, u32)>> = batches
+        .par_iter()
+        .enumerate()
+        .map(|(bi, batch)| scan_topn_f64_desc(batch, col_idx, limit, bi as u32))
+        .collect();
+
+    // Phase 2 — merge into global top-K
+    let mut global: Vec<(f64, u32, u32)> = per_batch.into_iter().flatten().collect();
+    global.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    global.truncate(limit);
+
+    if global.is_empty() {
+        return Ok(Some(RecordBatch::new_empty(schema)));
+    }
+
+    // Phase 3 — materialize rows in global order (zero-copy slice + concat)
+    let slices: Vec<RecordBatch> = global
+        .iter()
+        .map(|(_, bi, ri)| batches[*bi as usize].slice(*ri as usize, 1))
+        .collect();
+    let result = compute::concat_batches(&schema, &slices)?;
+    Ok(Some(result))
+}
+
+fn scan_topn_f64_desc(
+    batch: &RecordBatch,
+    col_idx: usize,
+    limit: usize,
+    batch_idx: u32,
+) -> Vec<(f64, u32, u32)> {
+    let arr = batch
+        .column(col_idx)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("topn: expected Float64Array");
+    let n = arr.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let k = limit.min(n);
+    let mut top_vals: Vec<f64> = vec![f64::NEG_INFINITY; k];
+    let mut top_rows: Vec<u32> = vec![0u32; k];
+    let mut filled: usize = 0;
+    let mut min_pos: usize = 0;
+    let mut min_val: f64 = f64::NEG_INFINITY;
+    let has_nulls = arr.null_count() > 0;
+    let values: &[f64] = arr.values();
+
+    if !has_nulls {
+        for i in 0..n {
+            let v = unsafe { *values.get_unchecked(i) };
+            if filled < k {
+                top_vals[filled] = v;
+                top_rows[filled] = i as u32;
+                filled += 1;
+                if filled == k {
+                    let (mp, mv) = argmin(&top_vals);
+                    min_pos = mp;
+                    min_val = mv;
+                }
+            } else if v > min_val {
+                top_vals[min_pos] = v;
+                top_rows[min_pos] = i as u32;
+                let (mp, mv) = argmin(&top_vals);
+                min_pos = mp;
+                min_val = mv;
+            }
+        }
+    } else {
+        for i in 0..n {
+            if arr.is_null(i) {
+                continue;
+            }
+            let v = values[i];
+            if filled < k {
+                top_vals[filled] = v;
+                top_rows[filled] = i as u32;
+                filled += 1;
+                if filled == k {
+                    let (mp, mv) = argmin(&top_vals);
+                    min_pos = mp;
+                    min_val = mv;
+                }
+            } else if v > min_val {
+                top_vals[min_pos] = v;
+                top_rows[min_pos] = i as u32;
+                let (mp, mv) = argmin(&top_vals);
+                min_pos = mp;
+                min_val = mv;
+            }
+        }
+    }
+
+    (0..filled)
+        .map(|i| (top_vals[i], batch_idx, top_rows[i]))
+        .collect()
+}
+
+#[inline(always)]
+fn argmin(vals: &[f64]) -> (usize, f64) {
+    let mut mp = 0;
+    let mut mv = vals[0];
+    for j in 1..vals.len() {
+        if vals[j] < mv {
+            mv = vals[j];
+            mp = j;
+        }
+    }
+    (mp, mv)
 }
 
 fn take_by_indices(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch> {
