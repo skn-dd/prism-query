@@ -49,9 +49,23 @@ substrait = "0.52"
 prost = "0.13"
 prost-types = "0.13"
 
-# Arrow Flight / gRPC (must match arrow-flight's tonic version)
-tonic = "0.12"
+# Arrow Flight / gRPC (must match arrow-flight's tonic version).
+#
+# `tls` enables tonic's rustls-backed TLS support (pulls in `rustls-pemfile`
+# 2.x and `tokio-rustls` 0.26 transitively). We deliberately stay on
+# tonic's high-level wrapper rather than hand-rolling rustls so that we get
+# a maintained, memory-safe TLS stack with TLS 1.3 cipher defaults. See
+# `prism-flight/src/tls.rs` for the loader.
+tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
+
+# rustls + PEM parsing. Transitively these are already pulled in by
+# `tonic`'s `tls` feature, but we pin them explicitly so the loader in
+# `prism-flight/src/tls.rs` compiles even if a future tonic bump drops
+# them from the public surface.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 # JNI
 jni = "0.21"

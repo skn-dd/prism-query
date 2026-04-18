@@ -26,6 +26,7 @@ use tonic::transport::Server;
 use tracing::Level;
 
 use prism_flight::shuffle_writer::{PartitionStore, ShuffleFlightService};
+use prism_flight::tls::{load_server_tls_config, TlsConfig as FlightTlsConfig};
 use handler::QueryHandler;
 
 #[derive(Parser)]
@@ -89,7 +90,45 @@ async fn main() -> anyhow::Result<()> {
         .max_decoding_message_size(max_msg)
         .max_encoding_message_size(max_msg);
 
-    Server::builder()
+    // Build the server. Wire TLS in unless explicitly disabled. Fail
+    // fast on TLS misconfiguration so that a broken cert mount doesn't
+    // silently degrade to plaintext.
+    let mut builder = Server::builder();
+    if cfg.tls.enabled {
+        let tls_cfg = FlightTlsConfig {
+            cert_path: cfg.tls.cert_path.clone(),
+            key_path: cfg.tls.key_path.clone(),
+            client_ca_path: if cfg.tls.client_ca_path.as_os_str().is_empty() {
+                None
+            } else {
+                Some(cfg.tls.client_ca_path.clone())
+            },
+            client_cn_pattern: cfg.tls.client_cn_pattern.clone(),
+        };
+        let material = load_server_tls_config(&tls_cfg)
+            .map_err(|e| anyhow::anyhow!("TLS config invalid: {}", e))?;
+        let mode = if material.mtls { "mTLS" } else { "TLS (server-auth only)" };
+        tracing::info!("Flight {} enabled (cert={:?})", mode, cfg.tls.cert_path);
+        eprintln!("Flight {} enabled (cert={:?})", mode, cfg.tls.cert_path);
+        // `.tls_config(ServerTlsConfig)` takes a value, not an Arc — we
+        // keep an `Arc<ServerTlsConfig>` in TlsMaterial so a future
+        // hot-reload path can swap the config atomically. For now we
+        // clone out of the Arc once, at startup.
+        builder = builder
+            .tls_config((*material.server_config).clone())
+            .map_err(|e| anyhow::anyhow!("failed to install TLS config: {}", e))?;
+    } else {
+        tracing::warn!(
+            "TLS is DISABLED — plaintext Flight. This is for local \
+             development only; production deployments MUST set \
+             `tls.enabled = true`."
+        );
+        eprintln!(
+            "WARNING: TLS disabled — plaintext Flight (development mode only)"
+        );
+    }
+
+    builder
         .add_service(flight_svc)
         .serve(addr)
         .await?;

@@ -5,6 +5,7 @@
 
 pub mod shuffle_reader;
 pub mod shuffle_writer;
+pub mod tls;
 
 /// Identifies a shuffle partition.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]

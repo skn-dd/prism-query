@@ -20,6 +20,15 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# TLS: rustls / rustls-pemfile are used directly by `src/tls.rs` to
+# validate and parse the PEM material before handing it to tonic's
+# `ServerTlsConfig`. This keeps the parsing + diagnostics in our code
+# (clear error messages, path-aware failures) while reusing tonic's
+# acceptor for the wire protocol. Cipher suites are rustls defaults
+# (TLS 1.3 preferred).
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
 [dev-dependencies]
 arrow = { workspace = true }
 tokio = { workspace = true }
