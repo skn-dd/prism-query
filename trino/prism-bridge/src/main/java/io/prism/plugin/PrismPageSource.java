@@ -2,9 +2,12 @@ package io.prism.plugin;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.prism.bridge.PrismErrorMapper;
 import io.prism.bridge.PrismFlightExecutor;
 import io.prism.bridge.SubstraitSerializer;
 import io.trino.spi.Page;
+import io.trino.spi.StandardErrorCode;
+import io.trino.spi.TrinoException;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.type.*;
@@ -111,9 +114,23 @@ public class PrismPageSource implements ConnectorPageSource {
             finished = true;
             readTimeNanos += System.nanoTime() - startNanos;
             return null;
+        } catch (TrinoException te) {
+            finished = true;
+            throw te;
         } catch (Exception e) {
             finished = true;
-            throw new RuntimeException("Prism execution failed: " + e.getMessage(), e);
+            // CompletableFuture.join() wraps causes in CompletionException; unwrap to
+            // surface the classified TrinoException thrown by the worker lambda.
+            Throwable root = e;
+            while (root instanceof java.util.concurrent.CompletionException && root.getCause() != null) {
+                root = root.getCause();
+            }
+            if (root instanceof TrinoException te) {
+                throw te;
+            }
+            String workerAddr = executor.workerAddress(split.getWorkerIndex());
+            throw PrismErrorMapper.wrap(workerAddr,
+                    "page fetch for table " + tableHandle.getTableName(), root);
         }
     }
 
@@ -194,8 +211,11 @@ public class PrismPageSource implements ConnectorPageSource {
             futures[i] = CompletableFuture.runAsync(() -> {
                 try {
                     executor.executeQuery(wi, cmdJson);
+                } catch (TrinoException te) {
+                    throw te;
                 } catch (Exception e) {
-                    throw new RuntimeException("Worker " + wi + " failed: " + e.getMessage(), e);
+                    throw PrismErrorMapper.wrap(executor.workerAddress(wi),
+                            "executeQuery (worker " + wi + ")", e);
                 }
             });
         }
@@ -290,8 +310,11 @@ public class PrismPageSource implements ConnectorPageSource {
             futures[i] = CompletableFuture.runAsync(() -> {
                 try {
                     executor.executeQuery(wi, cmdJson);
+                } catch (TrinoException te) {
+                    throw te;
                 } catch (Exception e) {
-                    throw new RuntimeException("Worker " + wi + " failed: " + e.getMessage(), e);
+                    throw PrismErrorMapper.wrap(executor.workerAddress(wi),
+                            "executeQuery (worker " + wi + ")", e);
                 }
             });
         }
@@ -387,8 +410,11 @@ public class PrismPageSource implements ConnectorPageSource {
             futures[i] = CompletableFuture.runAsync(() -> {
                 try {
                     executor.executeQuery(wi, cmdJson);
+                } catch (TrinoException te) {
+                    throw te;
                 } catch (Exception e) {
-                    throw new RuntimeException("Worker " + wi + " failed: " + e.getMessage(), e);
+                    throw PrismErrorMapper.wrap(executor.workerAddress(wi),
+                            "executeQuery (worker " + wi + ")", e);
                 }
             });
         }
