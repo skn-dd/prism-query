@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.prism.bridge.PrismFlightExecutor;
 import io.prism.bridge.SubstraitSerializer;
+import io.prism.plugin.events.PrismQueryStats;
 import io.trino.spi.Page;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.connector.ConnectorPageSource;
@@ -28,6 +29,7 @@ public class PrismPageSource implements ConnectorPageSource {
     private final PrismSplit split;
     private final PrismTableHandle tableHandle;
     private final List<PrismColumnHandle> columns;
+    private final PrismQueryStats queryStats;
 
     private boolean finished;
     private boolean executed;
@@ -47,10 +49,26 @@ public class PrismPageSource implements ConnectorPageSource {
             PrismSplit split,
             PrismTableHandle tableHandle,
             List<PrismColumnHandle> columns) {
+        this(executor, split, tableHandle, columns, null);
+    }
+
+    public PrismPageSource(
+            PrismFlightExecutor executor,
+            PrismSplit split,
+            PrismTableHandle tableHandle,
+            List<PrismColumnHandle> columns,
+            PrismQueryStats queryStats) {
         this.executor = executor;
         this.split = split;
         this.tableHandle = tableHandle;
         this.columns = columns;
+        this.queryStats = queryStats;
+        if (queryStats != null) {
+            // A PrismPageSource was created => pushdown was accepted and a
+            // worker invocation will happen. Flag acceleration early so that
+            // even if the query fails later we still record it touched Prism.
+            queryStats.markAccelerationUsed();
+        }
     }
 
     @Override
@@ -92,6 +110,7 @@ public class PrismPageSource implements ConnectorPageSource {
                 mergedPageReturned = true;
                 readTimeNanos += System.nanoTime() - startNanos;
                 Page page = mergedPage;
+                recordRowsProduced(page.getPositionCount());
                 finished = true;
                 return page;
             }
@@ -104,6 +123,7 @@ public class PrismPageSource implements ConnectorPageSource {
             // Single-worker path: stream from Flight
             if (flightStream != null && flightStream.next()) {
                 Page page = ArrowPageConverter.toPage(root, columns);
+                recordRowsProduced(page.getPositionCount());
                 readTimeNanos += System.nanoTime() - startNanos;
                 return page;
             }
@@ -172,6 +192,7 @@ public class PrismPageSource implements ConnectorPageSource {
     private void executeOnAllWorkersConcat() throws Exception {
         PrismPlanNode plan = tableHandle.getPushedPlan().orElseThrow();
         byte[] substraitBytes = SubstraitSerializer.serialize(plan);
+        recordPlanBytes(substraitBytes.length);
         String planB64 = Base64.getEncoder().encodeToString(substraitBytes);
 
         int workerCount = executor.workerCount();
@@ -182,10 +203,12 @@ public class PrismPageSource implements ConnectorPageSource {
         addJoinTables(plan, tablesTemplate);
 
         // Execute on all workers in parallel
+        long fanOutStartMs = System.currentTimeMillis();
         CompletableFuture<?>[] futures = new CompletableFuture[workerCount];
         for (int i = 0; i < workerCount; i++) {
             final int wi = i;
             resultKeys[i] = "result/" + UUID.randomUUID();
+            recordWorkerId(wi);
             ObjectNode command = MAPPER.createObjectNode();
             command.put("substrait_plan_b64", planB64);
             command.put("result_key", resultKeys[i]);
@@ -200,6 +223,7 @@ public class PrismPageSource implements ConnectorPageSource {
             });
         }
         CompletableFuture.allOf(futures).join();
+        recordRustRuntimeMs(System.currentTimeMillis() - fanOutStartMs);
 
         // Collect all rows from all workers
         List<Object[]> allRows = new ArrayList<>();
@@ -267,6 +291,7 @@ public class PrismPageSource implements ConnectorPageSource {
         PrismPlanNode workerPlan = replaceAggregates(plan, aggNode, workerAggs);
 
         byte[] substraitBytes = SubstraitSerializer.serialize(workerPlan);
+        recordPlanBytes(substraitBytes.length);
         String planB64 = Base64.getEncoder().encodeToString(substraitBytes);
 
         int workerCount = executor.workerCount();
@@ -278,10 +303,12 @@ public class PrismPageSource implements ConnectorPageSource {
         addJoinTables(plan, tablesTemplate);
 
         // Execute on all workers in parallel
+        long fanOutStartMs = System.currentTimeMillis();
         CompletableFuture<?>[] futures = new CompletableFuture[workerCount];
         for (int i = 0; i < workerCount; i++) {
             final int wi = i;
             resultKeys[i] = "result/" + UUID.randomUUID();
+            recordWorkerId(wi);
             ObjectNode command = MAPPER.createObjectNode();
             command.put("substrait_plan_b64", planB64);
             command.put("result_key", resultKeys[i]);
@@ -296,6 +323,7 @@ public class PrismPageSource implements ConnectorPageSource {
             });
         }
         CompletableFuture.allOf(futures).join();
+        recordRustRuntimeMs(System.currentTimeMillis() - fanOutStartMs);
 
         // Merge using EXPANDED aggregates
         int workerAggCount = workerAggs.size();
@@ -365,6 +393,7 @@ public class PrismPageSource implements ConnectorPageSource {
         long limit = sortNode.limit();
 
         byte[] substraitBytes = SubstraitSerializer.serialize(plan);
+        recordPlanBytes(substraitBytes.length);
         String planB64 = Base64.getEncoder().encodeToString(substraitBytes);
 
         int workerCount = executor.workerCount();
@@ -375,10 +404,12 @@ public class PrismPageSource implements ConnectorPageSource {
         addJoinTables(plan, tablesTemplate);
 
         // Execute on all workers in parallel
+        long fanOutStartMs = System.currentTimeMillis();
         CompletableFuture<?>[] futures = new CompletableFuture[workerCount];
         for (int i = 0; i < workerCount; i++) {
             final int wi = i;
             resultKeys[i] = "result/" + UUID.randomUUID();
+            recordWorkerId(wi);
             ObjectNode command = MAPPER.createObjectNode();
             command.put("substrait_plan_b64", planB64);
             command.put("result_key", resultKeys[i]);
@@ -393,6 +424,7 @@ public class PrismPageSource implements ConnectorPageSource {
             });
         }
         CompletableFuture.allOf(futures).join();
+        recordRustRuntimeMs(System.currentTimeMillis() - fanOutStartMs);
 
         // The plan is Sort(Project([orig_col_indices...]), ...) — worker returns
         // only the projected columns. Build mapping from original table index to
@@ -639,6 +671,7 @@ public class PrismPageSource implements ConnectorPageSource {
 
         byte[] substraitBytes = SubstraitSerializer.serialize(plan);
         String planB64 = Base64.getEncoder().encodeToString(substraitBytes);
+        recordPlanBytes(substraitBytes.length);
 
         String resultKey = "result/" + UUID.randomUUID();
         ObjectNode command = MAPPER.createObjectNode();
@@ -649,10 +682,37 @@ public class PrismPageSource implements ConnectorPageSource {
         tablesNode.put(tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
         addJoinTables(plan, tablesNode);
 
+        recordWorkerId(split.getWorkerIndex());
+        long workerStartMs = System.currentTimeMillis();
         executor.executeQuery(split.getWorkerIndex(), MAPPER.writeValueAsString(command));
+        recordRustRuntimeMs(System.currentTimeMillis() - workerStartMs);
 
         flightStream = executor.fetchResultStream(split.getWorkerIndex(), resultKey);
         root = flightStream.getRoot();
+    }
+
+    private void recordPlanBytes(long bytes) {
+        if (queryStats != null) {
+            queryStats.recordSubstraitPlanBytes(bytes);
+        }
+    }
+
+    private void recordWorkerId(int workerIndex) {
+        if (queryStats != null) {
+            queryStats.addWorkerId("worker-" + workerIndex);
+        }
+    }
+
+    private void recordRustRuntimeMs(long ms) {
+        if (queryStats != null) {
+            queryStats.addRustRuntimeMs(ms);
+        }
+    }
+
+    private void recordRowsProduced(long rows) {
+        if (queryStats != null) {
+            queryStats.addRowsProduced(rows);
+        }
     }
 
     @Override
