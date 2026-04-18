@@ -404,9 +404,13 @@ fn col_stats_might_match(
         None => return true,
     };
 
+    // Arrow/Parquet 57 removed `Statistics::has_min_max_set`; the recommended check
+    // is to consult `min_opt()`/`max_opt()` directly. `stats_might_match` already
+    // tolerates a None min/max via `unwrap_or` fallbacks, so we just pass stats
+    // through and let the per-branch logic decide whether the row group might match.
     let stats = match col_chunk.statistics() {
-        Some(s) if s.has_min_max_set() => s,
-        _ => return true,
+        Some(s) => s,
+        None => return true,
     };
 
     stats_might_match(op, val, stats)
