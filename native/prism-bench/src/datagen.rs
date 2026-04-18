@@ -42,7 +42,9 @@ pub fn make_lineitem_shard(row_count: usize, row_offset: usize, chunk_size: usiz
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int64Array::from((g_start..g_end).map(|i| i as i64).collect::<Vec<_>>())),
+                // l_orderkey: i / 4 so 4 line items share each orderkey, keeping keys
+                // within [0, num_orders) and preserving the orders FK relationship.
+                Arc::new(Int64Array::from((g_start..g_end).map(|i| (i / 4) as i64).collect::<Vec<_>>())),
                 Arc::new(Int64Array::from(
                     (g_start..g_end).map(|i| (i % 200_000) as i64).collect::<Vec<_>>(),
                 )),

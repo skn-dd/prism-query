@@ -97,15 +97,22 @@ public class SubstraitSerializer {
         if (node instanceof PrismPlanNode.Project proj) {
             PrismPlanNode optimizedInput = pushProjectionsIntoJoin(proj.input());
 
-            // Handle nested Project → Project → Join:
-            // Compose the two Projects into one, then push into the Join.
-            if (optimizedInput instanceof PrismPlanNode.Project innerProj
-                    && innerProj.input() instanceof PrismPlanNode.Join join) {
+            // Collapse Project → Project chains into a single Project when safe.
+            // Trino can emit stacks of Projects (e.g., after multiple applyProjection calls).
+            // We can only compose if the outer Project's output ordering matches the
+            // "all passthroughs then all expressions" layout our executor uses; otherwise
+            // composition reorders outputs and breaks downstream column references.
+            if (optimizedInput instanceof PrismPlanNode.Project innerProj) {
                 PrismPlanNode composed = composeProjects(proj, innerProj);
-                if (composed instanceof PrismPlanNode.Project composedProj) {
-                    return pushProjectIntoJoin(composedProj, join);
+                if (composed != null) {
+                    // Re-run to handle cases where the composed Project's input is a Join.
+                    return pushProjectionsIntoJoin(composed);
                 }
-                return composed;
+                // Composition would reorder outputs: keep nested structure
+                if (optimizedInput != proj.input()) {
+                    return new PrismPlanNode.Project(optimizedInput, proj.columnIndices(), proj.expressions());
+                }
+                return node;
             }
 
             if (optimizedInput instanceof PrismPlanNode.Join join) {
@@ -140,9 +147,11 @@ public class SubstraitSerializer {
      * Returns a new plan with Project nodes inside the Join for each side.
      */
     private static PrismPlanNode pushProjectIntoJoin(PrismPlanNode.Project proj, PrismPlanNode.Join join) {
-        // Determine left/right column counts from scan schemas
-        int leftColCount = countScanColumns(join.left());
-        int rightColCount = countScanColumns(join.right());
+        // Determine left/right OUTPUT column counts. When join.left()/.right() are
+        // already Projects (from the Trino plan), their output width — not the
+        // underlying Scan width — is what parent column indices reference.
+        int leftColCount = countOutputColumns(join.left());
+        int rightColCount = countOutputColumns(join.right());
         if (leftColCount <= 0 || rightColCount <= 0) {
             return proj; // Can't optimize without knowing schema sizes
         }
@@ -250,6 +259,23 @@ public class SubstraitSerializer {
         int innerPassCount = inner.columnIndices().size();
         int innerExprCount = (inner.expressions() != null) ? inner.expressions().size() : 0;
 
+        // Safety check: our Project executor always emits passthrough cols first, then
+        // expression outputs. If outer's columnIndices interleaves refs to inner's cols
+        // (<innerPassCount) and inner's exprs (>=innerPassCount) in a way that would change
+        // output ordering after composition, skip composition and keep projects nested.
+        boolean sawExprRef = false;
+        for (int outerIdx : outer.columnIndices()) {
+            boolean isExprRef = outerIdx >= innerPassCount;
+            if (isExprRef) {
+                sawExprRef = true;
+            } else if (sawExprRef) {
+                // A passthrough ref appears AFTER an expr ref: composition would reorder.
+                LOG.info("composeProjects: skipping composition — outer cols {} would reorder after composing inner cols={} exprs={}",
+                        outer.columnIndices(), innerPassCount, innerExprCount);
+                return null;
+            }
+        }
+
         List<Integer> newCols = new ArrayList<>();
         List<PrismPlanNode.ScalarExprNode> newExprs = new ArrayList<>();
 
@@ -321,6 +347,27 @@ public class SubstraitSerializer {
         }
         if (node instanceof PrismPlanNode.Filter f) return countScanColumns(f.input());
         if (node instanceof PrismPlanNode.Project p) return countScanColumns(p.input());
+        return 0;
+    }
+
+    /**
+     * Returns the number of OUTPUT columns produced by a node.
+     * Project output = columnIndices + expressions. Scan output = all scan columns.
+     */
+    private static int countOutputColumns(PrismPlanNode node) {
+        if (node instanceof PrismPlanNode.Scan scan) {
+            return scan.columns() != null ? scan.columns().size() : 0;
+        }
+        if (node instanceof PrismPlanNode.Project p) {
+            int cols = p.columnIndices() != null ? p.columnIndices().size() : 0;
+            int exprs = p.expressions() != null ? p.expressions().size() : 0;
+            return cols + exprs;
+        }
+        if (node instanceof PrismPlanNode.Filter f) return countOutputColumns(f.input());
+        if (node instanceof PrismPlanNode.Sort s) return countOutputColumns(s.input());
+        if (node instanceof PrismPlanNode.Join j) {
+            return countOutputColumns(j.left()) + countOutputColumns(j.right());
+        }
         return 0;
     }
 

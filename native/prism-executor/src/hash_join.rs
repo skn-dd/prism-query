@@ -4,7 +4,7 @@
 //! from the build side, then probes with the probe side.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::compute;
@@ -16,6 +16,33 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rayon::prelude::*;
 
 use crate::Result;
+
+/// Pass-through hasher for u64 keys that are already well-distributed.
+/// Skips SipHash — our `hash_i64_fast` output is already spread across u64.
+#[derive(Default)]
+struct PassThroughU64(u64);
+
+impl Hasher for PassThroughU64 {
+    #[inline]
+    fn finish(&self) -> u64 { self.0 }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Only called via write_u64 in our usage, but provide a safe fallback.
+        for (i, b) in bytes.iter().enumerate().take(8) {
+            self.0 |= (*b as u64) << (i * 8);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) { self.0 = n; }
+}
+
+type FastMap<V> = HashMap<u64, V, BuildHasherDefault<PassThroughU64>>;
+
+/// Build-side partition count. Must be a power of two.
+/// 64 partitions means ~2.3M rows per partition at SF100 scale — each
+/// partition hash table fits comfortably in L3.
+const HASH_PARTITIONS: usize = 64;
+const HASH_PART_MASK: u64 = (HASH_PARTITIONS as u64) - 1;
 
 /// Join type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,26 +64,73 @@ pub struct HashJoinConfig {
 }
 
 /// A hash table built from the build side of a join.
+///
+/// The table is partitioned into `HASH_PARTITIONS` sub-maps by the low bits
+/// of the hash. Partitioning lets us build in parallel and keeps each sub-map
+/// small enough to fit in L3 cache during probe.
 pub struct HashTable {
-    index: HashMap<u64, Vec<u32>>,
+    partitions: Vec<FastMap<Vec<u32>>>,
     build_batch: RecordBatch,
     key_cols: Vec<usize>,
+    /// True when the single key column is Int64 and `hash_i64_fast` was used
+    /// (the hash is then bijective on i64, so hash equality implies key equality).
+    skip_key_check: bool,
 }
 
 impl HashTable {
     pub fn build(batch: &RecordBatch, key_cols: &[usize]) -> Result<Self> {
         let num_rows = batch.num_rows();
-        let mut index: HashMap<u64, Vec<u32>> = HashMap::with_capacity(num_rows);
+        let skip_key_check = key_cols.len() == 1
+            && batch.column(key_cols[0]).data_type() == &DataType::Int64;
 
-        for row_idx in 0..num_rows {
-            let h = hash_row(batch, key_cols, row_idx);
-            index.entry(h).or_default().push(row_idx as u32);
+        // Step 1: compute all row hashes in parallel.
+        // For the Int64 fast path, precompute a raw slice outside the closure.
+        let hashes: Vec<u64> = if skip_key_check {
+            let col = batch.column(key_cols[0]).as_primitive::<Int64Type>();
+            let vals = col.values();
+            (0..num_rows)
+                .into_par_iter()
+                .map(|i| hash_i64_fast(vals[i]))
+                .collect()
+        } else {
+            (0..num_rows)
+                .into_par_iter()
+                .map(|i| hash_row(batch, key_cols, i))
+                .collect()
+        };
+
+        // Step 2: partition (hash, row_idx) pairs by hash bits.
+        // This is serial but cheap (one pass over u64s).
+        let mut part_rows: Vec<Vec<(u64, u32)>> =
+            (0..HASH_PARTITIONS).map(|_| Vec::new()).collect();
+        let rows_per_part = num_rows / HASH_PARTITIONS + 1;
+        for p in &mut part_rows {
+            p.reserve(rows_per_part);
+        }
+        for (i, &h) in hashes.iter().enumerate() {
+            part_rows[(h & HASH_PART_MASK) as usize].push((h, i as u32));
         }
 
+        // Step 3: build each partition's map in parallel.
+        let partitions: Vec<FastMap<Vec<u32>>> = part_rows
+            .into_par_iter()
+            .map(|entries| {
+                let mut m: FastMap<Vec<u32>> = FastMap::with_capacity_and_hasher(
+                    entries.len(),
+                    BuildHasherDefault::default(),
+                );
+                for (h, r) in entries {
+                    m.entry(h).or_default().push(r);
+                }
+                m
+            })
+            .collect();
+
         Ok(HashTable {
-            index,
+            partitions,
             build_batch: batch.clone(),
             key_cols: key_cols.to_vec(),
+            skip_key_check,
         })
     }
 
@@ -65,12 +139,38 @@ impl HashTable {
         probe_batch: &RecordBatch,
         probe_key_cols: &[usize],
     ) -> Result<(UInt32Array, UInt32Array)> {
-        let mut probe_indices = Vec::new();
-        let mut build_indices = Vec::new();
+        let n = probe_batch.num_rows();
+        let mut probe_indices: Vec<u32> = Vec::with_capacity(n);
+        let mut build_indices: Vec<u32> = Vec::with_capacity(n);
 
-        for probe_row in 0..probe_batch.num_rows() {
+        // Fast path: single Int64 key, hash is bijective → no keys_equal.
+        if self.skip_key_check
+            && probe_key_cols.len() == 1
+            && probe_batch.column(probe_key_cols[0]).data_type() == &DataType::Int64
+        {
+            let col = probe_batch.column(probe_key_cols[0]).as_primitive::<Int64Type>();
+            let vals = col.values();
+            for probe_row in 0..n {
+                let h = hash_i64_fast(vals[probe_row]);
+                let part = &self.partitions[(h & HASH_PART_MASK) as usize];
+                if let Some(build_rows) = part.get(&h) {
+                    for &build_row in build_rows {
+                        probe_indices.push(probe_row as u32);
+                        build_indices.push(build_row);
+                    }
+                }
+            }
+            return Ok((
+                UInt32Array::from(probe_indices),
+                UInt32Array::from(build_indices),
+            ));
+        }
+
+        // General path: verify with keys_equal on hash hit.
+        for probe_row in 0..n {
             let h = hash_row(probe_batch, probe_key_cols, probe_row);
-            if let Some(build_rows) = self.index.get(&h) {
+            let part = &self.partitions[(h & HASH_PART_MASK) as usize];
+            if let Some(build_rows) = part.get(&h) {
                 for &build_row in build_rows {
                     if keys_equal(
                         probe_batch,

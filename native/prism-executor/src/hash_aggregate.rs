@@ -334,8 +334,13 @@ fn global_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -> 
             AggFunc::Count => {
                 let partials: Vec<u64> = batches.par_iter()
                     .map(|batch| {
-                        let col = batch.column(agg.column);
-                        (col.len() - col.null_count()) as u64
+                        if agg.column >= batch.num_columns() {
+                            // COUNT(*) on zero-column batch — count all rows
+                            batch.num_rows() as u64
+                        } else {
+                            let col = batch.column(agg.column);
+                            (col.len() - col.null_count()) as u64
+                        }
                     })
                     .collect();
                 partials.iter().sum::<u64>() as f64

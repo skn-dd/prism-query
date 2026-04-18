@@ -57,36 +57,45 @@ impl ActionHandler for QueryHandler {
             let mut hints = extract_scan_hints(&plan.root);
             extract_projection_hints(&plan.root, &mut hints);
 
-            // Fast path: COUNT(*) from Parquet metadata only (no data reading)
+            tracing::info!("DBG_PLAN: {:#?}", plan.root);
+            for (t, h) in &hints {
+                tracing::info!("DBG_HINT: table={} projection={:?} predicate={:?}", t, h.projection, h.predicate);
+            }
+
+            // Fast path: unfiltered COUNT(*) from Parquet metadata only (no data reading).
+            // Only used when there is NO predicate — filtered COUNT(*) must go through
+            // the executor for exact results (row-group skipping only gives an overestimate).
             if let Some(data_dir) = self.data_dir.as_deref() {
                 if let Some((table_name, pred)) = detect_count_star(&plan.root) {
-                    if let Some(store_key) = command["tables"]
-                        .as_object()
-                        .and_then(|m| m.get(&table_name))
-                        .and_then(|v| v.as_str())
-                    {
-                        let parquet_dir = data_dir.join(store_key);
-                        if parquet_dir.exists() {
-                            let count = parquet_row_count(
-                                &parquet_dir,
-                                pred.as_ref(),
-                            ).map_err(|e| anyhow::anyhow!("Parquet row count error: {}", e))?;
+                    if pred.is_none() {
+                        if let Some(store_key) = command["tables"]
+                            .as_object()
+                            .and_then(|m| m.get(&table_name))
+                            .and_then(|v| v.as_str())
+                        {
+                            let parquet_dir = data_dir.join(store_key);
+                            if parquet_dir.exists() {
+                                let count = parquet_row_count(
+                                    &parquet_dir,
+                                    None,
+                                ).map_err(|e| anyhow::anyhow!("Parquet row count error: {}", e))?;
 
-                            tracing::info!(
-                                "COUNT(*) metadata shortcut for '{}': {} rows in {:.2}ms",
-                                table_name,
-                                count,
-                                start.elapsed().as_secs_f64() * 1000.0,
-                            );
+                                tracing::info!(
+                                    "COUNT(*) metadata shortcut for '{}': {} rows in {:.2}ms",
+                                    table_name,
+                                    count,
+                                    start.elapsed().as_secs_f64() * 1000.0,
+                                );
 
-                            let schema = Arc::new(Schema::new(vec![
-                                Field::new(&plan.root.aggregate_output_name().unwrap_or("cnt".into()),
-                                           DataType::Int64, true),
-                            ]));
-                            return Ok(RecordBatch::try_new(
-                                schema,
-                                vec![Arc::new(Int64Array::from(vec![count as i64]))],
-                            )?);
+                                let schema = Arc::new(Schema::new(vec![
+                                    Field::new(&plan.root.aggregate_output_name().unwrap_or("cnt".into()),
+                                               DataType::Int64, true),
+                                ]));
+                                return Ok(RecordBatch::try_new(
+                                    schema,
+                                    vec![Arc::new(Int64Array::from(vec![count as i64]))],
+                                )?);
+                            }
                         }
                     }
                 }
@@ -94,14 +103,18 @@ impl ActionHandler for QueryHandler {
 
             // Load tables — Parquet with pushdown if available, else in-memory
             let (tables, col_remaps) = load_tables_smart(&command, store, self.data_dir.as_deref(), &hints).await?;
+            for (t, batches) in &tables {
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                let cols = batches.first().map(|b| b.num_columns()).unwrap_or(0);
+                let schema_str = batches.first().map(|b| format!("{:?}", b.schema().fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>())).unwrap_or_default();
+                tracing::info!("DBG_LOAD: table={} rows={} cols={} nbatches={} schema={}", t, rows, cols, batches.len(), schema_str);
+            }
 
-            // Remap column indices if we used skip_expand for projected Parquet loading.
-            // Only safe for single-table queries (avoid misremapping JOIN columns).
+            // Remap column indices for projected Parquet loading with skip_expand.
+            // Handles single-table (trivial) and multi-table JOIN cases (per-subtree remap).
             let mut plan_root = plan.root.clone();
-            if col_remaps.len() == 1 {
-                for (_table_name, remap) in &col_remaps {
-                    remap_plan_for_table(&mut plan_root, _table_name, remap);
-                }
+            if !col_remaps.is_empty() {
+                remap_plan_multi_table(&mut plan_root, &col_remaps);
             }
 
             let result = prism_substrait::executor::execute_plan_chunked(&plan_root, &tables)
@@ -309,9 +322,6 @@ async fn load_tables_smart(
     let mut tables: HashMap<String, Vec<RecordBatch>> = HashMap::new();
     let mut col_remaps: HashMap<String, HashMap<usize, usize>> = HashMap::new();
 
-    // Only use skip_expand for single-table queries to avoid JOIN column conflicts
-    let is_single_table = tables_map.len() == 1;
-
     for (name, key_val) in tables_map {
         let key = key_val
             .as_str()
@@ -327,8 +337,9 @@ async fn load_tables_smart(
                 // Column pruning: only read columns the query actually needs
                 let projection = hint.and_then(|h| h.projection.clone());
 
-                // Use skip_expand to avoid null array creation overhead (single-table only)
-                let has_projection = projection.is_some() && is_single_table;
+                // Use skip_expand for all queries — multi-table JOINs are handled
+                // via per-subtree column remapping in remap_plan_multi_table
+                let has_projection = projection.is_some();
 
                 let start = Instant::now();
                 let batches = parquet_scan(&ParquetScanConfig {
@@ -376,18 +387,216 @@ async fn load_tables_smart(
     Ok((tables, col_remaps))
 }
 
-/// Remap column indices in the plan tree for a specific table's scan node.
-/// This is used when we loaded projected Parquet data with skip_expand=true,
-/// meaning the batches have only the projected columns (not the full schema).
-fn remap_plan_for_table(
+/// Remap column indices in the plan tree for multiple tables loaded with skip_expand.
+/// Handles JOINs correctly by applying per-subtree remaps and adjusting offsets
+/// at Join boundaries (left subtree uses left table's remap, right subtree uses right's,
+/// above-join references are rewritten using a combined remap based on the new output schema).
+fn remap_plan_multi_table(
     node: &mut prism_substrait::plan::PlanNode,
-    table_name: &str,
+    table_remaps: &HashMap<String, HashMap<usize, usize>>,
+) {
+    let _ = remap_plan_rec(node, table_remaps);
+}
+
+/// Recursive helper. Returns an "outer remap" (original_col → new_col) describing
+/// how to translate column references in THIS node's output schema.
+fn remap_plan_rec(
+    node: &mut prism_substrait::plan::PlanNode,
+    table_remaps: &HashMap<String, HashMap<usize, usize>>,
+) -> HashMap<usize, usize> {
+    use prism_substrait::plan::PlanNode;
+
+    match node {
+        PlanNode::Scan { table_name, projection, .. } => {
+            if let Some(remap) = table_remaps.get(table_name) {
+                if let Some(proj) = projection {
+                    for idx in proj.iter_mut() {
+                        if let Some(&new_idx) = remap.get(idx) {
+                            *idx = new_idx;
+                        }
+                    }
+                }
+                remap.clone()
+            } else {
+                HashMap::new()
+            }
+        }
+        PlanNode::Filter { input, predicate } => {
+            let input_remap = remap_plan_rec(input, table_remaps);
+            remap_predicate_local(predicate, &input_remap);
+            input_remap
+        }
+        PlanNode::Project { input, columns, expressions } => {
+            let input_remap = remap_plan_rec(input, table_remaps);
+
+            // Remap expression column refs using input_remap.
+            for expr in expressions.iter_mut() {
+                remap_expr_local(expr, &input_remap);
+            }
+
+            let n_cols_old = columns.len();
+            let n_exprs = expressions.len();
+            let mut output_remap: HashMap<usize, usize> = HashMap::new();
+
+            if input_remap.is_empty() {
+                // No pruning below — identity remap, columns unchanged.
+                let n_total = n_cols_old + n_exprs;
+                for i in 0..n_total {
+                    output_remap.insert(i, i);
+                }
+                return output_remap;
+            }
+
+            // Input was pruned. Drop columns referring to unloaded input cols.
+            // push_columns_down guarantees that any column referenced by the parent
+            // is in input_remap — dropped cols are only those never referenced above.
+            let mut new_columns = Vec::with_capacity(n_cols_old);
+            for (old_pos, &c) in columns.iter().enumerate() {
+                if let Some(&new_c) = input_remap.get(&c) {
+                    let new_pos = new_columns.len();
+                    new_columns.push(new_c);
+                    output_remap.insert(old_pos, new_pos);
+                }
+            }
+            let new_n_cols = new_columns.len();
+            *columns = new_columns;
+
+            // Expressions stay, but their output positions shift after dropped cols.
+            for expr_idx in 0..n_exprs {
+                let old_pos = n_cols_old + expr_idx;
+                let new_pos = new_n_cols + expr_idx;
+                output_remap.insert(old_pos, new_pos);
+            }
+
+            output_remap
+        }
+        PlanNode::Aggregate { input, group_by, aggregates } => {
+            let input_remap = remap_plan_rec(input, table_remaps);
+            for idx in group_by.iter_mut() {
+                if let Some(&new_idx) = input_remap.get(idx) {
+                    *idx = new_idx;
+                }
+            }
+            for agg in aggregates.iter_mut() {
+                if let Some(&new_idx) = input_remap.get(&agg.column) {
+                    agg.column = new_idx;
+                }
+            }
+            let n = group_by.len() + aggregates.len();
+            (0..n).map(|i| (i, i)).collect()
+        }
+        PlanNode::Join { left, right, left_keys, right_keys, .. } => {
+            let left_full_cols = find_scan_full_cols(left);
+            let left_remap = remap_plan_rec(left, table_remaps);
+            let right_remap = remap_plan_rec(right, table_remaps);
+
+            // left_keys/right_keys index into each subtree's output. If the subtree
+            // is a Scan (no inner Project), left_keys use left_remap. If there's an
+            // inner Project, left_keys are already in projected local space [0..N-1]
+            // (identity remap from Project returns {0→0, 1→1, ...}).
+            for idx in left_keys.iter_mut() {
+                if let Some(&new_idx) = left_remap.get(idx) {
+                    *idx = new_idx;
+                }
+            }
+            for idx in right_keys.iter_mut() {
+                if let Some(&new_idx) = right_remap.get(idx) {
+                    *idx = new_idx;
+                }
+            }
+
+            // Build combined outer remap covering both original concat space
+            // (when no inner Project) and projected concat space (when inner Project).
+            // Original refs get offset math; projected refs (0..N) pass through unchanged.
+            let left_proj_count = left_remap.values().map(|&v| v + 1).max().unwrap_or(0);
+            let mut combined: HashMap<usize, usize> = HashMap::new();
+            for (&orig, &new_idx) in &left_remap {
+                combined.insert(orig, new_idx);
+            }
+            for (&orig, &new_idx) in &right_remap {
+                combined.insert(left_full_cols + orig, left_proj_count + new_idx);
+            }
+            combined
+        }
+        PlanNode::Sort { input, sort_keys, .. } => {
+            let input_remap = remap_plan_rec(input, table_remaps);
+            for key in sort_keys.iter_mut() {
+                if let Some(&new_idx) = input_remap.get(&key.column) {
+                    key.column = new_idx;
+                }
+            }
+            input_remap
+        }
+        PlanNode::Exchange { input, partition_keys, .. } => {
+            let input_remap = remap_plan_rec(input, table_remaps);
+            for idx in partition_keys.iter_mut() {
+                if let Some(&new_idx) = input_remap.get(idx) {
+                    *idx = new_idx;
+                }
+            }
+            input_remap
+        }
+    }
+}
+
+fn find_scan_full_cols(node: &prism_substrait::plan::PlanNode) -> usize {
+    use prism_substrait::plan::PlanNode;
+    match node {
+        PlanNode::Scan { schema, .. } => schema.fields().len(),
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Exchange { input, .. } => find_scan_full_cols(input),
+        PlanNode::Join { left, right, .. } => {
+            find_scan_full_cols(left) + find_scan_full_cols(right)
+        }
+    }
+}
+
+fn remap_predicate_local(
+    pred: &mut prism_executor::filter_project::Predicate,
     col_map: &HashMap<usize, usize>,
 ) {
-    // Use the PlanNode::remap_columns method which recursively remaps all column references
-    // Only remap if this plan actually references the given table
-    // For simplicity, remap the entire tree (safe since each table has distinct column spaces)
-    node.remap_columns(col_map);
+    use prism_executor::filter_project::Predicate::*;
+    match pred {
+        Eq(c, _) | Ne(c, _) | Lt(c, _) | Le(c, _) | Gt(c, _) | Ge(c, _) => {
+            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+        }
+        IsNull(c) | IsNotNull(c) => {
+            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+        }
+        Like(c, _) | ILike(c, _) => {
+            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+        }
+        And(l, r) | Or(l, r) => {
+            remap_predicate_local(l, col_map);
+            remap_predicate_local(r, col_map);
+        }
+        Not(inner) => {
+            remap_predicate_local(inner, col_map);
+        }
+    }
+}
+
+fn remap_expr_local(
+    expr: &mut prism_executor::filter_project::ScalarExpr,
+    col_map: &HashMap<usize, usize>,
+) {
+    use prism_executor::filter_project::ScalarExpr::*;
+    match expr {
+        ColumnRef(c) => {
+            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+        }
+        Literal(_) => {}
+        BinaryOp { left, right, .. } => {
+            remap_expr_local(left, col_map);
+            remap_expr_local(right, col_map);
+        }
+        Negate(inner) => {
+            remap_expr_local(inner, col_map);
+        }
+    }
 }
 
 /// Load tables from the partition store, concatenating all chunks into single RecordBatches.

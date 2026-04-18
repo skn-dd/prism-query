@@ -3,3 +3,5 @@ target/
 *.jar
 .idea/
 *.iml
+*.pem
+__pycache__/

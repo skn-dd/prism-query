@@ -130,6 +130,15 @@ pub fn filter_batch(batch: &RecordBatch, mask: &BooleanArray) -> Result<RecordBa
 
 /// Project specific columns from a RecordBatch by index.
 pub fn project_batch(batch: &RecordBatch, column_indices: &[usize]) -> Result<RecordBatch> {
+    // Handle empty projection (e.g., COUNT(*) with no column references)
+    if column_indices.is_empty() {
+        let empty_schema = SchemaRef::new(arrow_schema::Schema::empty());
+        return Ok(RecordBatch::try_new_with_options(
+            empty_schema,
+            vec![],
+            &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+        )?);
+    }
     let schema = batch.schema();
     let projected_fields: Vec<_> = column_indices
         .iter()
