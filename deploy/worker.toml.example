@@ -1,0 +1,61 @@
+# /etc/prism/worker.toml — Prism worker configuration example.
+#
+# Precedence (lowest to highest):
+#   1. Built-in defaults compiled into prism-worker
+#   2. This file (passed via --config, or auto-loaded from /etc/prism/worker.toml)
+#   3. Environment variables prefixed PRISM_ (e.g. PRISM_SERVER_BIND)
+#   4. CLI flags (--port, --data-dir, ...)
+#
+# Copy to /etc/prism/worker.toml, edit, then start the worker with
+# `prism-worker` (no flags) or `prism-worker --config /path/to/worker.toml`.
+
+[server]
+# host:port the gRPC/Flight server binds to.
+bind = "0.0.0.0:50051"
+# gRPC max decoding/encoding message size. Raise for large RecordBatches.
+max_message_size_mb = 256
+
+[runtime]
+# Memory budget for the worker (GB). 0 = unlimited.
+max_memory_gb = 0
+# Worker thread pool size. 0 = num_cpus.
+worker_threads = 0
+
+[data]
+# Default data directory for local-Parquet mode (legacy/bench).
+# For cloud deployments, tables are resolved via URIs in the execute
+# command and this field can be omitted.
+data_dir = "/data/prism"
+
+[logging]
+# One of: trace, debug, info, warn, error
+level = "info"
+# One of: pretty, json
+format = "pretty"
+
+# -----------------------------------------------------------------------------
+# Reserved namespaces — not yet implemented. The prism-worker binary accepts
+# these sections in the file but will not use them until later phases.
+# -----------------------------------------------------------------------------
+
+# [tls]
+# cert_file = "/etc/prism/tls/server.crt"
+# key_file  = "/etc/prism/tls/server.key"
+# client_ca = "/etc/prism/tls/client-ca.pem"
+
+# [telemetry]
+# otlp_endpoint = "http://otel-collector.observability:4317"
+# service_name  = "prism-worker"
+
+# [object_store.s3]
+# region = "us-west-2"
+# bucket = "prism-data"
+# # credentials: prefer IAM instance profiles; env vars honored as fallback.
+
+# [object_store.gcs]
+# bucket = "prism-data"
+# # credentials via GOOGLE_APPLICATION_CREDENTIALS or workload identity.
+
+# [object_store.azure]
+# account = "prismdata"
+# container = "prism"
