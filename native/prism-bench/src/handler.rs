@@ -75,10 +75,12 @@ impl ActionHandler for QueryHandler {
                         {
                             let parquet_dir = data_dir.join(store_key);
                             if parquet_dir.exists() {
+                                let uri = parquet_dir.to_string_lossy().into_owned();
                                 let count = parquet_row_count(
-                                    &parquet_dir,
+                                    &uri,
                                     None,
-                                ).map_err(|e| anyhow::anyhow!("Parquet row count error: {}", e))?;
+                                ).await
+                                 .map_err(|e| anyhow::anyhow!("Parquet row count error: {}", e))?;
 
                                 tracing::info!(
                                     "COUNT(*) metadata shortcut for '{}': {} rows in {:.2}ms",
@@ -342,13 +344,15 @@ async fn load_tables_smart(
                 let has_projection = projection.is_some();
 
                 let start = Instant::now();
+                let uri = parquet_dir.to_string_lossy().into_owned();
                 let batches = parquet_scan(&ParquetScanConfig {
-                    path: parquet_dir,
+                    uri,
                     predicate,
                     projection: projection.clone(),
                     batch_size: 1_048_576,
                     skip_expand: has_projection,
                 })
+                .await
                 .map_err(|e| anyhow::anyhow!("Parquet scan error for '{}': {}", name, e))?;
 
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();

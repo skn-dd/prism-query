@@ -1,26 +1,34 @@
-//! Parquet reader with column pruning, row-group-level predicate skipping,
-//! and parallel I/O via rayon.
+//! Async Parquet reader with column pruning, row-group-level predicate
+//! skipping, and per-file parallelism via `tokio::task::spawn`.
+//!
+//! All file I/O flows through `object_store::ObjectStore`, so the same code
+//! handles `file://`, `s3://`, `gs://`, `abfs[s]://` and bare local paths.
+//! Per-file fan-out runs on the tokio runtime; row-group statistics are still
+//! consulted to skip unmatched groups before any column data is fetched.
 
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use arrow_array::{ArrayRef, new_null_array};
+use arrow_array::{new_null_array, ArrayRef};
 use arrow_schema::{Schema, SchemaRef};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ProjectionMask;
+use futures::stream::{self, StreamExt, TryStreamExt};
+use object_store::path::Path as ObjectPath;
+use object_store::ObjectStore;
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use parquet::arrow::async_reader::ParquetObjectReader;
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
-use rayon::prelude::*;
 
-use crate::error::Result;
+use crate::error::{PrismError, Result};
 use crate::filter_project::{Predicate, ScalarValue};
+use crate::object_source::{list_files, parse_uri};
 
 /// Configuration for a Parquet table scan.
 pub struct ParquetScanConfig {
-    /// Path to a directory containing .parquet files (or a single file).
-    pub path: PathBuf,
+    /// URI of a directory or single file. Schemes: `file://`, `s3://`,
+    /// `gs://`, `abfs[s]://`, or a bare local path.
+    pub uri: String,
     /// Optional predicate for row group skipping.
     pub predicate: Option<Predicate>,
     /// Column projection — only read these column indices from Parquet.
@@ -33,38 +41,46 @@ pub struct ParquetScanConfig {
     pub skip_expand: bool,
 }
 
-/// Scan Parquet files with parallel I/O, skipping row groups whose statistics
+/// Scan Parquet files asynchronously, skipping row groups whose statistics
 /// prove the predicate cannot match.
-pub fn parquet_scan(config: &ParquetScanConfig) -> Result<Vec<RecordBatch>> {
-    let files = list_parquet_files(&config.path)?;
+pub async fn parquet_scan(config: &ParquetScanConfig) -> Result<Vec<RecordBatch>> {
+    let (store, prefix) = parse_uri(&config.uri)?;
+    let files = list_files(&*store, &prefix, "parquet").await?;
     if files.is_empty() {
-        return Err(crate::PrismError::Internal(format!(
-            "no .parquet files found at {:?}",
-            config.path
+        return Err(PrismError::Internal(format!(
+            "no .parquet files found at {}",
+            config.uri
         )));
     }
 
-    // Peek at first file for schema info
-    let first_file = fs::File::open(&files[0]).map_err(|e| {
-        crate::PrismError::Internal(format!("failed to open {:?}: {}", files[0], e))
-    })?;
-    let peek_builder = ParquetRecordBatchReaderBuilder::try_new(first_file).map_err(|e| {
-        crate::PrismError::Internal(format!("failed to read parquet {:?}: {}", files[0], e))
-    })?;
-    let full_schema: SchemaRef = peek_builder.schema().clone();
+    // Peek at the first file for the full schema (used for projection-expansion).
+    let peek_meta = read_file_metadata(store.clone(), &files[0]).await?;
+    let full_schema: SchemaRef = peek_meta.schema().clone();
 
-    // Read files in parallel using rayon
-    let file_results: Vec<std::result::Result<(Vec<RecordBatch>, usize, usize), String>> = files
-        .par_iter()
-        .map(|file_path| {
-            read_parquet_file(file_path, config)
-        })
-        .collect();
+    // Per-file fan-out via tokio. We bound concurrency at num_cpus to mimic
+    // the previous rayon behaviour without saturating the runtime.
+    let parallelism = std::cmp::max(1, num_cpus_or_default());
+    let predicate = config.predicate.clone();
+    let projection = config.projection.clone();
+    let batch_size = config.batch_size;
+
+    type FileResult = std::result::Result<(Vec<RecordBatch>, usize, usize), String>;
+    let file_results: Vec<FileResult> = stream::iter(files.iter().cloned())
+            .map(|file_path| {
+                let store = store.clone();
+                let predicate = predicate.clone();
+                let projection = projection.clone();
+                async move {
+                    read_parquet_file(store, file_path, predicate, projection, batch_size).await
+                }
+            })
+            .buffer_unordered(parallelism)
+            .collect()
+            .await;
 
     let mut all_batches = Vec::new();
     let mut total_skipped = 0usize;
     let mut total_groups = 0usize;
-
     for result in file_results {
         match result {
             Ok((batches, skipped, total)) => {
@@ -72,7 +88,7 @@ pub fn parquet_scan(config: &ParquetScanConfig) -> Result<Vec<RecordBatch>> {
                 total_groups += total;
                 all_batches.extend(batches);
             }
-            Err(e) => return Err(crate::PrismError::Internal(e)),
+            Err(e) => return Err(PrismError::Internal(e)),
         }
     }
 
@@ -106,15 +122,18 @@ pub fn parquet_scan(config: &ParquetScanConfig) -> Result<Vec<RecordBatch>> {
 }
 
 /// Read a single Parquet file, applying row group skipping and projection.
-fn read_parquet_file(
-    file_path: &Path,
-    config: &ParquetScanConfig,
+async fn read_parquet_file(
+    store: Arc<dyn ObjectStore>,
+    file_path: ObjectPath,
+    predicate: Option<Predicate>,
+    projection: Option<Vec<usize>>,
+    batch_size: usize,
 ) -> std::result::Result<(Vec<RecordBatch>, usize, usize), String> {
-    let file = fs::File::open(file_path)
-        .map_err(|e| format!("failed to open {:?}: {}", file_path, e))?;
-
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| format!("failed to read parquet {:?}: {}", file_path, e))?;
+    // Build a ParquetObjectReader and load metadata.
+    let reader = ParquetObjectReader::new(store, file_path.clone());
+    let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(|e| format!("parquet builder for {}: {}", file_path, e))?;
 
     let metadata = builder.metadata().clone();
     let schema = builder.schema().clone();
@@ -124,7 +143,7 @@ fn read_parquet_file(
 
     let row_groups_to_read: Vec<usize> = (0..num_row_groups)
         .filter(|&i| {
-            if let Some(ref pred) = config.predicate {
+            if let Some(ref pred) = predicate {
                 let rg_meta = metadata.row_group(i);
                 let should_read = row_group_might_match(pred, rg_meta, &schema);
                 if !should_read {
@@ -141,33 +160,28 @@ fn read_parquet_file(
         return Ok((Vec::new(), skipped, num_row_groups));
     }
 
-    // Re-open file for reading
-    let file = fs::File::open(file_path)
-        .map_err(|e| format!("failed to reopen {:?}: {}", file_path, e))?;
-
-    let mut reader_builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| format!("parquet builder: {}", e))?;
-
-    // Apply column projection — filter out virtual column indices that exceed the schema
-    if let Some(ref proj_cols) = config.projection {
-        let parquet_schema = reader_builder.parquet_schema();
+    if let Some(ref proj_cols) = projection {
+        let parquet_schema = builder.parquet_schema();
         let num_cols = parquet_schema.num_columns();
         let valid_cols: Vec<usize> = proj_cols.iter().copied().filter(|&c| c < num_cols).collect();
         if !valid_cols.is_empty() {
-            let mask = ProjectionMask::roots(&parquet_schema, valid_cols.into_iter());
-            reader_builder = reader_builder.with_projection(mask);
+            let mask = ProjectionMask::roots(parquet_schema, valid_cols.into_iter());
+            builder = builder.with_projection(mask);
         }
     }
 
-    let reader = reader_builder
+    let stream = builder
         .with_row_groups(row_groups_to_read)
-        .with_batch_size(config.batch_size)
+        .with_batch_size(batch_size)
         .build()
-        .map_err(|e| format!("parquet reader: {}", e))?;
+        .map_err(|e| format!("parquet stream build {}: {}", file_path, e))?;
 
     let mut batches = Vec::new();
-    for batch_result in reader {
-        let batch = batch_result.map_err(|e| format!("parquet read: {}", e))?;
+    let collected: Vec<RecordBatch> = stream
+        .try_collect()
+        .await
+        .map_err(|e| format!("parquet read {}: {}", file_path, e))?;
+    for batch in collected {
         if batch.num_rows() > 0 {
             batches.push(batch);
         }
@@ -178,19 +192,15 @@ fn read_parquet_file(
 
 /// Get the total row count from Parquet metadata without reading any data.
 /// This is used for COUNT(*) optimization.
-pub fn parquet_row_count(path: &Path, predicate: Option<&Predicate>) -> Result<usize> {
-    let files = list_parquet_files(path)?;
+pub async fn parquet_row_count(uri: &str, predicate: Option<&Predicate>) -> Result<usize> {
+    let (store, prefix) = parse_uri(uri)?;
+    let files = list_files(&*store, &prefix, "parquet").await?;
     let mut total = 0usize;
 
     for file_path in &files {
-        let file = fs::File::open(file_path).map_err(|e| {
-            crate::PrismError::Internal(format!("failed to open {:?}: {}", file_path, e))
-        })?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-            crate::PrismError::Internal(format!("failed to read parquet {:?}: {}", file_path, e))
-        })?;
-        let metadata = builder.metadata();
-        let schema = builder.schema();
+        let meta = read_file_metadata(store.clone(), file_path).await?;
+        let metadata = meta.metadata();
+        let schema = meta.schema();
 
         for i in 0..metadata.num_row_groups() {
             let rg_meta = metadata.row_group(i);
@@ -207,6 +217,22 @@ pub fn parquet_row_count(path: &Path, predicate: Option<&Predicate>) -> Result<u
     Ok(total)
 }
 
+async fn read_file_metadata(
+    store: Arc<dyn ObjectStore>,
+    file_path: &ObjectPath,
+) -> Result<ArrowReaderMetadata> {
+    let mut reader = ParquetObjectReader::new(store, file_path.clone());
+    ArrowReaderMetadata::load_async(&mut reader, Default::default())
+        .await
+        .map_err(|e| PrismError::Internal(format!("parquet metadata {}: {}", file_path, e)))
+}
+
+fn num_cpus_or_default() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+}
+
 /// Check if a row group might contain rows matching the predicate.
 /// Returns `false` if the row group can be definitively skipped.
 pub fn row_group_might_match(
@@ -215,22 +241,12 @@ pub fn row_group_might_match(
     schema: &Schema,
 ) -> bool {
     match predicate {
-        Predicate::Eq(col, val) => {
-            col_stats_might_match(*col, CmpOp::Eq, val, rg_meta, schema)
-        }
+        Predicate::Eq(col, val) => col_stats_might_match(*col, CmpOp::Eq, val, rg_meta, schema),
         Predicate::Ne(_col, _val) => true,
-        Predicate::Lt(col, val) => {
-            col_stats_might_match(*col, CmpOp::Lt, val, rg_meta, schema)
-        }
-        Predicate::Le(col, val) => {
-            col_stats_might_match(*col, CmpOp::Le, val, rg_meta, schema)
-        }
-        Predicate::Gt(col, val) => {
-            col_stats_might_match(*col, CmpOp::Gt, val, rg_meta, schema)
-        }
-        Predicate::Ge(col, val) => {
-            col_stats_might_match(*col, CmpOp::Ge, val, rg_meta, schema)
-        }
+        Predicate::Lt(col, val) => col_stats_might_match(*col, CmpOp::Lt, val, rg_meta, schema),
+        Predicate::Le(col, val) => col_stats_might_match(*col, CmpOp::Le, val, rg_meta, schema),
+        Predicate::Gt(col, val) => col_stats_might_match(*col, CmpOp::Gt, val, rg_meta, schema),
+        Predicate::Ge(col, val) => col_stats_might_match(*col, CmpOp::Ge, val, rg_meta, schema),
         Predicate::IsNull(_) | Predicate::IsNotNull(_) => true,
         Predicate::And(left, right) => {
             row_group_might_match(left, rg_meta, schema)
@@ -384,49 +400,24 @@ fn expand_projected_batches(
         }
 
         let expanded_batch = RecordBatch::try_new(expanded_schema.clone(), columns)
-            .map_err(|e| crate::PrismError::Internal(format!("expand batch: {}", e)))?;
+            .map_err(|e| PrismError::Internal(format!("expand batch: {}", e)))?;
         expanded.push(expanded_batch);
     }
 
     Ok(expanded)
 }
 
-/// List all .parquet files in a directory (or return the single file).
-fn list_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
-    if path.is_file() {
-        return Ok(vec![path.to_path_buf()]);
-    }
-
-    if !path.is_dir() {
-        return Err(crate::PrismError::Internal(format!(
-            "path {:?} is neither a file nor a directory",
-            path
-        )));
-    }
-
-    let mut files: Vec<PathBuf> = fs::read_dir(path)
-        .map_err(|e| crate::PrismError::Internal(format!("readdir {:?}: {}", path, e)))?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("parquet") {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    files.sort();
-    Ok(files)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path as FsPath, PathBuf};
     use std::sync::Arc;
+
     use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{ObjectStore, PutPayload};
     use parquet::arrow::ArrowWriter;
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
@@ -439,20 +430,26 @@ mod tests {
         ]))
     }
 
-    fn write_test_parquet(path: &Path, row_group_size: usize) {
+    fn build_test_parquet_bytes(row_group_size: usize) -> Vec<u8> {
         let schema = test_schema();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-
         let n = 500;
         let ids: Vec<i64> = (0..n).collect();
         let values: Vec<f64> = (0..n).map(|i| i as f64).collect();
-        let names: Vec<&str> = (0..n).map(|i| {
-            if i < 100 { "alpha" }
-            else if i < 200 { "beta" }
-            else if i < 300 { "gamma" }
-            else if i < 400 { "delta" }
-            else { "epsilon" }
-        }).collect();
+        let names: Vec<&str> = (0..n)
+            .map(|i| {
+                if i < 100 {
+                    "alpha"
+                } else if i < 200 {
+                    "beta"
+                } else if i < 300 {
+                    "gamma"
+                } else if i < 400 {
+                    "delta"
+                } else {
+                    "epsilon"
+                }
+            })
+            .collect();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -461,7 +458,8 @@ mod tests {
                 Arc::new(Float64Array::from(values)),
                 Arc::new(StringArray::from(names)),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
@@ -469,88 +467,136 @@ mod tests {
             .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
             .build();
 
-        let file = fs::File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
+        buf
     }
 
-    #[test]
-    fn test_parquet_statistics_are_written() {
+    fn write_test_parquet(path: &FsPath, row_group_size: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = build_test_parquet_bytes(row_group_size);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_parquet_statistics_are_written() {
         let dir = PathBuf::from("/tmp/test_parquet_stats_written");
-        let _ = fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("test.parquet");
         write_test_parquet(&path, 100);
 
-        let file = fs::File::open(&path).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-        let metadata = builder.metadata();
-        assert_eq!(metadata.num_row_groups(), 5);
+        // Round-trip metadata through the async API.
+        let (store, prefix) = parse_uri(dir.to_str().unwrap()).unwrap();
+        let files = list_files(&*store, &prefix, "parquet").await.unwrap();
+        assert_eq!(files.len(), 1);
+        let meta = read_file_metadata(store.clone(), &files[0]).await.unwrap();
+        assert_eq!(meta.metadata().num_row_groups(), 5);
 
-        let _ = fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_row_group_skipping() {
+    #[tokio::test]
+    async fn test_row_group_skipping() {
         let dir = PathBuf::from("/tmp/test_parquet_rg_skipping");
-        let _ = fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("test.parquet");
         write_test_parquet(&path, 100);
 
         let pred = Predicate::Lt(1, ScalarValue::Float64(150.0));
         let config = ParquetScanConfig {
-            path: path.clone(),
+            uri: dir.to_string_lossy().into_owned(),
             predicate: Some(pred),
             projection: None,
             batch_size: 8192,
             skip_expand: false,
         };
 
-        let batches = parquet_scan(&config).unwrap();
+        let batches = parquet_scan(&config).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 200);
 
-        let _ = fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_string_stats_skipping() {
+    #[tokio::test]
+    async fn test_string_stats_skipping() {
         let dir = PathBuf::from("/tmp/test_parquet_string_skip");
-        let _ = fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("test.parquet");
         write_test_parquet(&path, 100);
 
         let pred = Predicate::Eq(2, ScalarValue::Utf8("gamma".to_string()));
         let config = ParquetScanConfig {
-            path: path.clone(),
+            uri: dir.to_string_lossy().into_owned(),
             predicate: Some(pred),
             projection: None,
             batch_size: 8192,
             skip_expand: false,
         };
 
-        let batches = parquet_scan(&config).unwrap();
+        let batches = parquet_scan(&config).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 100);
 
-        let _ = fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_row_count_metadata() {
+    #[tokio::test]
+    async fn test_row_count_metadata() {
         let dir = PathBuf::from("/tmp/test_parquet_row_count");
-        let _ = fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("test.parquet");
         write_test_parquet(&path, 100);
 
-        let count = parquet_row_count(&path, None).unwrap();
+        let count = parquet_row_count(dir.to_str().unwrap(), None).await.unwrap();
         assert_eq!(count, 500);
 
         // With predicate that skips some row groups
         let pred = Predicate::Lt(1, ScalarValue::Float64(150.0));
-        let count = parquet_row_count(&path, Some(&pred)).unwrap();
+        let count = parquet_row_count(dir.to_str().unwrap(), Some(&pred))
+            .await
+            .unwrap();
         assert_eq!(count, 200);
 
-        let _ = fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Integration test: prove the abstraction works against a non-local
+    /// `ObjectStore` by reading from `InMemory`.
+    #[tokio::test]
+    async fn test_parquet_scan_from_in_memory_store() {
+        let bytes = build_test_parquet_bytes(100);
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = ObjectPath::from("tables/sample");
+        let file = ObjectPath::from("tables/sample/data.parquet");
+        store
+            .put(&file, PutPayload::from(bytes))
+            .await
+            .unwrap();
+
+        // Verify list_files sees the upload.
+        let listed = list_files(&*store, &prefix, "parquet").await.unwrap();
+        assert_eq!(listed, vec![file.clone()]);
+
+        // Drive a real scan through ParquetObjectReader against InMemory.
+        let meta = read_file_metadata(store.clone(), &file).await.unwrap();
+        assert_eq!(meta.metadata().num_row_groups(), 5);
+
+        let predicate = Predicate::Lt(1, ScalarValue::Float64(150.0));
+        let (batches, skipped, total) = read_parquet_file(
+            store,
+            file,
+            Some(predicate),
+            None,
+            8192,
+        )
+        .await
+        .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 200);
+        assert_eq!(total, 5);
+        assert!(skipped >= 3, "expected ≥3 skipped row groups, got {}", skipped);
     }
 }
