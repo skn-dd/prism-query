@@ -33,15 +33,33 @@ level = "info"
 # One of: pretty, json
 format = "pretty"
 
+[tls]
+# mTLS for the Arrow Flight gRPC transport. Production deployments MUST
+# leave `enabled = true`; `false` is an escape hatch for local dev only.
+#
+# Cert rotation: this slice rotates via pod restart. Mount cert-manager
+# Certificate material as a Kubernetes Secret at the paths below. When
+# the Secret updates, recreate the pod. Hot-reload is a follow-up.
+#
+# The PEM files are expected to be:
+#   cert_path:       server certificate chain (leaf first)
+#   key_path:        server private key (PKCS#8 / RSA / SEC1)
+#   client_ca_path:  CA bundle used to verify the CLIENT cert (mTLS).
+#                    Empty string → server-auth-only TLS (not recommended).
+#   client_cn_pattern:
+#                    Optional pattern a peer cert's CN/SAN must match.
+#                    Empty = accept any peer cert signed by the CA.
+#                    Enforcement will land with the authorization hook.
+enabled = true
+cert_path = "/etc/prism/tls/server.crt"
+key_path  = "/etc/prism/tls/server.key"
+client_ca_path = "/etc/prism/tls/ca.crt"
+client_cn_pattern = ""
+
 # -----------------------------------------------------------------------------
 # Reserved namespaces — not yet implemented. The prism-worker binary accepts
 # these sections in the file but will not use them until later phases.
 # -----------------------------------------------------------------------------
-
-# [tls]
-# cert_file = "/etc/prism/tls/server.crt"
-# key_file  = "/etc/prism/tls/server.key"
-# client_ca = "/etc/prism/tls/client-ca.pem"
 
 # [telemetry]
 # otlp_endpoint = "http://otel-collector.observability:4317"

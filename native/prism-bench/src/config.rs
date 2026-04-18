@@ -12,8 +12,11 @@
 //! implementation detail of this module.
 //!
 //! Future TOML namespaces reserved but not yet implemented:
-//!   `[tls]`, `[telemetry]`, `[object_store.s3]`, `[object_store.gcs]`,
+//!   `[telemetry]`, `[object_store.s3]`, `[object_store.gcs]`,
 //!   `[object_store.azure]`.
+//!
+//! The `[tls]` section IS implemented (Wave 2a slice 3). See
+//! [`TlsConfig`].
 
 use std::path::{Path, PathBuf};
 
@@ -46,6 +49,7 @@ pub struct WorkerConfig {
     pub runtime: RuntimeConfig,
     pub data: DataConfig,
     pub logging: LoggingConfig,
+    pub tls: TlsConfig,
 }
 
 impl Default for WorkerConfig {
@@ -55,6 +59,7 @@ impl Default for WorkerConfig {
             runtime: RuntimeConfig::default(),
             data: DataConfig::default(),
             logging: LoggingConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -111,6 +116,58 @@ pub struct DataConfig {
 impl Default for DataConfig {
     fn default() -> Self {
         Self { data_dir: None }
+    }
+}
+
+/// TLS / mTLS configuration for the Flight gRPC server.
+///
+/// When `enabled = true` (the default), the worker listens over TLS and
+/// fails fast at startup if any required cert/key path is missing or
+/// malformed. Plaintext (`enabled = false`) is reserved for local
+/// development only — production deployments always set `enabled = true`.
+///
+/// mTLS mode is implied by a non-empty `client_ca_path`: the server
+/// requires the client to present a certificate signed by that CA. When
+/// `client_ca_path` is empty, the server runs server-auth-only TLS.
+///
+/// Cert rotation: today, rotating certs requires a pod / process
+/// restart. cert-manager on Kubernetes mounts the material as a Secret;
+/// a pod restart on Secret change picks up the new material. Hot-reload
+/// is deferred to a follow-up slice; see
+/// `native/prism-flight/src/tls.rs` for notes on the extension shape.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// Master switch. `true` (default) = require TLS. `false` = plaintext
+    /// (development only — never set in production).
+    pub enabled: bool,
+    /// Path to the PEM-encoded server certificate chain.
+    pub cert_path: PathBuf,
+    /// Path to the PEM-encoded server private key (PKCS#8, RSA, or SEC1).
+    pub key_path: PathBuf,
+    /// Path to a PEM-encoded client CA bundle. Non-empty value enables
+    /// mTLS. Empty value = server-auth-only TLS.
+    pub client_ca_path: PathBuf,
+    /// Optional required pattern for the client cert's CN / SAN.
+    /// Empty string = accept any cert signed by the CA.
+    ///
+    /// Parsed + stored here; enforcement will land with the
+    /// authorization hook in a follow-up slice.
+    pub client_cn_pattern: String,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        // Default paths follow the layout that cert-manager produces
+        // when mounting a Certificate resource under `/etc/prism/tls/`.
+        // Production deployments override these via worker.toml.
+        Self {
+            enabled: true,
+            cert_path: PathBuf::from("/etc/prism/tls/server.crt"),
+            key_path: PathBuf::from("/etc/prism/tls/server.key"),
+            client_ca_path: PathBuf::from("/etc/prism/tls/ca.crt"),
+            client_cn_pattern: String::new(),
+        }
     }
 }
 
@@ -182,6 +239,36 @@ fn apply_env_overrides(cfg: &mut WorkerConfig) {
             cfg.runtime.max_memory_gb = parsed;
         }
     }
+    // TLS overrides — helpful for dev shells and CI that mount certs
+    // at nonstandard paths. The master switch accepts `1/true/yes/on`
+    // and `0/false/no/off`, case-insensitive.
+    if let Ok(v) = std::env::var("PRISM_TLS_ENABLED") {
+        if let Some(b) = parse_bool(&v) {
+            cfg.tls.enabled = b;
+        }
+    }
+    if let Ok(v) = std::env::var("PRISM_TLS_CERT_PATH") {
+        if !v.is_empty() {
+            cfg.tls.cert_path = PathBuf::from(v);
+        }
+    }
+    if let Ok(v) = std::env::var("PRISM_TLS_KEY_PATH") {
+        if !v.is_empty() {
+            cfg.tls.key_path = PathBuf::from(v);
+        }
+    }
+    if let Ok(v) = std::env::var("PRISM_TLS_CLIENT_CA_PATH") {
+        // Empty value clears the CA → falls back to one-way TLS.
+        cfg.tls.client_ca_path = PathBuf::from(v);
+    }
+}
+
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 fn apply_cli_overrides(cfg: &mut WorkerConfig, cli: &CliArgs) {
@@ -219,6 +306,10 @@ mod tests {
         "PRISM_DATA_DIR",
         "PRISM_LOGGING_LEVEL",
         "PRISM_RUNTIME_MAX_MEMORY_GB",
+        "PRISM_TLS_ENABLED",
+        "PRISM_TLS_CERT_PATH",
+        "PRISM_TLS_KEY_PATH",
+        "PRISM_TLS_CLIENT_CA_PATH",
     ];
 
     fn clear_env() {
@@ -256,6 +347,57 @@ mod tests {
         assert_eq!(cfg.data.data_dir, None);
         assert_eq!(cfg.logging.level, "info");
         assert_eq!(cfg.logging.format, "pretty");
+        // TLS defaults: enabled, cert-manager-style paths, no CN pattern.
+        assert!(cfg.tls.enabled);
+        assert_eq!(cfg.tls.cert_path, PathBuf::from("/etc/prism/tls/server.crt"));
+        assert_eq!(cfg.tls.key_path, PathBuf::from("/etc/prism/tls/server.key"));
+        assert_eq!(cfg.tls.client_ca_path, PathBuf::from("/etc/prism/tls/ca.crt"));
+        assert_eq!(cfg.tls.client_cn_pattern, "");
+    }
+
+    #[test]
+    fn parses_tls_toml() {
+        let toml_text = r#"
+[tls]
+enabled = false
+cert_path = "/x/server.crt"
+key_path = "/x/server.key"
+client_ca_path = ""
+client_cn_pattern = "prism-client-*"
+"#;
+        let cfg: WorkerConfig = toml::from_str(toml_text).expect("parse tls toml");
+        assert!(!cfg.tls.enabled);
+        assert_eq!(cfg.tls.cert_path, PathBuf::from("/x/server.crt"));
+        assert_eq!(cfg.tls.key_path, PathBuf::from("/x/server.key"));
+        assert_eq!(cfg.tls.client_ca_path, PathBuf::from(""));
+        assert_eq!(cfg.tls.client_cn_pattern, "prism-client-*");
+    }
+
+    #[test]
+    fn tls_env_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+
+        // Feed the loader an explicit (empty) toml so we aren't at the
+        // mercy of /etc/prism/worker.toml on the host.
+        let path = write_tmp("");
+        std::env::set_var("PRISM_TLS_ENABLED", "false");
+        std::env::set_var("PRISM_TLS_CERT_PATH", "/env/cert");
+        std::env::set_var("PRISM_TLS_KEY_PATH", "/env/key");
+        std::env::set_var("PRISM_TLS_CLIENT_CA_PATH", "/env/ca");
+
+        let cli = CliArgs {
+            config: Some(path.clone()),
+            ..Default::default()
+        };
+        let cfg = load(&cli).expect("load");
+        assert!(!cfg.tls.enabled);
+        assert_eq!(cfg.tls.cert_path, PathBuf::from("/env/cert"));
+        assert_eq!(cfg.tls.key_path, PathBuf::from("/env/key"));
+        assert_eq!(cfg.tls.client_ca_path, PathBuf::from("/env/ca"));
+
+        let _ = std::fs::remove_file(&path);
+        clear_env();
     }
 
     #[test]
