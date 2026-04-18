@@ -17,47 +17,48 @@ repository = "https://github.com/prism-query/prism"
 
 [workspace.dependencies]
 # Arrow ecosystem
-arrow = { version = "55", features = ["ffi"] }
-arrow-array = "55"
-arrow-buffer = "55"
-arrow-cast = "55"
-arrow-data = "55"
-arrow-flight = { version = "55", features = ["flight-sql-experimental"] }
-arrow-ipc = "55"
-arrow-ord = "55"
-arrow-schema = "55"
-arrow-select = "55"
-arrow-string = "55"
+arrow = { version = "57", features = ["ffi"] }
+arrow-array = "57"
+arrow-buffer = "57"
+arrow-cast = "57"
+arrow-data = "57"
+arrow-flight = { version = "57", features = ["flight-sql-experimental"] }
+arrow-ipc = "57"
+arrow-ord = "57"
+arrow-schema = "57"
+arrow-select = "57"
+arrow-string = "57"
 
 # Parquet columnar storage. `object_store` enables async + ParquetObjectReader.
-parquet = { version = "55", default-features = false, features = ["arrow", "snap", "object_store"] }
+parquet = { version = "57", default-features = false, features = ["arrow", "snap", "object_store"] }
 
 # Object storage abstraction (S3, GCS, Azure ADLS, local file system)
-# Version pinned to 0.12 for compatibility with parquet 55's internal dependency.
+# Version pinned for compatibility with parquet 57's internal dependency.
 object_store = { version = "0.12", features = ["aws", "gcp", "azure"] }
 url = "2"
 bytes = "1"
 
-# DataFusion (for expression evaluation and utilities)
-datafusion = "46"
-datafusion-common = "46"
-datafusion-expr = "46"
-datafusion-physical-expr = "46"
+# DataFusion (for expression evaluation and utilities).
+# DataFusion 51 is the first release that adopts arrow 57; 49/50 still pinned arrow 55/56.
+datafusion = "51"
+datafusion-common = "51"
+datafusion-expr = "51"
+datafusion-physical-expr = "51"
 
-# Substrait
-substrait = "0.52"
-prost = "0.13"
-prost-types = "0.13"
+# Substrait: datafusion-substrait 51 pulls in substrait ^0.62; keep the protobuf
+# version aligned so the IR types are identical across crates.
+substrait = "0.62"
+prost = "0.14"
+prost-types = "0.14"
 
 # Arrow Flight / gRPC (must match arrow-flight's tonic version).
 #
-# `tls` enables tonic's rustls-backed TLS support (pulls in `rustls-pemfile`
-# 2.x and `tokio-rustls` 0.26 transitively). We deliberately stay on
-# tonic's high-level wrapper rather than hand-rolling rustls so that we get
-# a maintained, memory-safe TLS stack with TLS 1.3 cipher defaults. See
-# `prism-flight/src/tls.rs` for the loader.
-tonic = { version = "0.12", features = ["tls"] }
-tonic-build = "0.12"
+# arrow-flight 57 depends on tonic ^0.14 and prost ^0.14, so the workspace
+# moves with it. Tonic 0.14 replaced the `tls` feature with explicit
+# `tls-ring` / `tls-aws-lc` variants; we stick with the ring backend to match
+# the rustls feature set configured below. See `prism-flight/src/tls.rs`.
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-build = "0.14"
 
 # rustls + PEM parsing. Transitively these are already pulled in by
 # `tonic`'s `tls` feature, but we pin them explicitly so the loader in
