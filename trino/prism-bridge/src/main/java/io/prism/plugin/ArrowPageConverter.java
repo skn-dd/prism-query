@@ -2,6 +2,8 @@ package io.prism.plugin;
 
 import io.airlift.slice.Slices;
 import io.trino.spi.Page;
+import io.trino.spi.StandardErrorCode;
+import io.trino.spi.TrinoException;
 import io.trino.spi.block.*;
 import io.trino.spi.type.*;
 import org.apache.arrow.vector.*;
@@ -47,7 +49,9 @@ public final class ArrowPageConverter {
             }
 
             if (vector == null) {
-                throw new RuntimeException("Column '" + colName + "' not found in Arrow result");
+                throw new TrinoException(
+                        StandardErrorCode.GENERIC_INTERNAL_ERROR,
+                        "Arrow result schema mismatch: column '" + colName + "' not found");
             }
 
             blocks[i] = convertVector(vector, rowCount);

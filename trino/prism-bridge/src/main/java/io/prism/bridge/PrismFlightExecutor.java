@@ -1,5 +1,6 @@
 package io.prism.bridge;
 
+import io.trino.spi.StandardErrorCode;
 import org.apache.arrow.flight.*;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -49,8 +50,20 @@ public class PrismFlightExecutor implements Closeable {
 
         for (String endpoint : workerEndpoints) {
             String[] parts = endpoint.split(":");
+            if (parts.length != 2) {
+                throw PrismErrorMapper.forCode(
+                        StandardErrorCode.CONFIGURATION_INVALID,
+                        "Prism worker endpoint is not in host:port form: '" + endpoint + "'");
+            }
             String host = parts[0];
-            int port = Integer.parseInt(parts[1]);
+            int port;
+            try {
+                port = Integer.parseInt(parts[1]);
+            } catch (NumberFormatException nfe) {
+                throw PrismErrorMapper.forCode(
+                        StandardErrorCode.CONFIGURATION_INVALID,
+                        "Prism worker endpoint has non-numeric port: '" + endpoint + "'");
+            }
 
             Location location = Location.forGrpcInsecure(host, port);
             FlightClient client = FlightClient.builder(allocator, location)
@@ -59,6 +72,17 @@ public class PrismFlightExecutor implements Closeable {
             clients.add(client);
             LOG.info("Connected to Rust worker at {}", endpoint);
         }
+    }
+
+    /**
+     * Return the host:port address for the given worker index,
+     * or {@code null} if the index is out of range.
+     */
+    public String workerAddress(int workerIndex) {
+        if (workerIndex < 0 || workerIndex >= workerAddresses.size()) {
+            return null;
+        }
+        return workerAddresses.get(workerIndex);
     }
 
     /**
@@ -113,7 +137,9 @@ public class PrismFlightExecutor implements Closeable {
             return body;
         }
 
-        throw new PrismExecutionException("Worker returned no result for execute action");
+        throw PrismErrorMapper.forCode(
+                StandardErrorCode.GENERIC_INTERNAL_ERROR,
+                "Prism executeQuery returned no result [worker=" + workerAddress(workerIndex) + "]");
     }
 
     /**

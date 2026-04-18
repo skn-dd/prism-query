@@ -1,5 +1,7 @@
 package io.prism.bridge;
 
+import io.trino.spi.StandardErrorCode;
+import io.trino.spi.TrinoException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -62,16 +64,24 @@ public class PrismNativeExecutor implements Closeable {
      * @param substraitPlan Substrait plan serialized as protobuf bytes
      * @param inputData     Input RecordBatches serialized as Arrow IPC stream
      * @return Output RecordBatches serialized as Arrow IPC stream
-     * @throws PrismExecutionException if native execution fails
+     * @throws TrinoException if native execution fails; carries a
+     *         {@link StandardErrorCode#GENERIC_INTERNAL_ERROR} by default.
      */
     public byte[] execute(byte[] substraitPlan, byte[] inputData) {
         if (closed) {
-            throw new IllegalStateException("PrismNativeExecutor has been shut down");
+            throw new TrinoException(
+                    StandardErrorCode.GENERIC_INTERNAL_ERROR,
+                    "PrismNativeExecutor has been shut down");
         }
         try {
             return executePlan(runtimeHandle, substraitPlan, inputData);
+        } catch (OutOfMemoryError oom) {
+            throw new TrinoException(
+                    StandardErrorCode.EXCEEDED_LOCAL_MEMORY_LIMIT,
+                    "Prism native execution exceeded local memory: " + oom.getMessage(),
+                    oom);
         } catch (RuntimeException e) {
-            throw new PrismExecutionException("Native execution failed", e);
+            throw PrismErrorMapper.wrap("native execution", e);
         }
     }
 

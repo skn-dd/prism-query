@@ -6,6 +6,8 @@ import io.substrait.proto.*;
 import io.substrait.proto.Expression;
 import io.substrait.proto.Expression.Literal;
 import io.substrait.proto.Type;
+import io.trino.spi.StandardErrorCode;
+import io.trino.spi.TrinoException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -503,7 +505,8 @@ public class SubstraitSerializer {
             case "MULTIPLY" -> FUNC_MULTIPLY;
             case "DIVIDE" -> FUNC_DIVIDE;
             case "NEGATE" -> FUNC_NEGATE;
-            default -> throw new IllegalArgumentException("Unknown arithmetic op: " + op);
+            default -> throw new TrinoException(StandardErrorCode.NOT_SUPPORTED,
+                    "Prism Substrait serializer: unsupported arithmetic op '" + op + "'");
         };
     }
 
@@ -752,7 +755,8 @@ public class SubstraitSerializer {
             case "LESS_THAN_OR_EQUAL", "<=" -> FUNC_LESS_EQUAL;
             case "GREATER_THAN", ">" -> FUNC_GREATER_THAN;
             case "GREATER_THAN_OR_EQUAL", ">=" -> FUNC_GREATER_EQUAL;
-            default -> throw new IllegalArgumentException("Unknown operator: " + operator);
+            default -> throw new TrinoException(StandardErrorCode.NOT_SUPPORTED,
+                    "Prism Substrait serializer: unsupported comparison operator '" + operator + "'");
         };
     }
 
@@ -764,7 +768,8 @@ public class SubstraitSerializer {
             case "MAX" -> AGG_MAX;
             case "AVG" -> AGG_AVG;
             case "COUNT_DISTINCT" -> AGG_COUNT_DISTINCT;
-            default -> throw new IllegalArgumentException("Unknown aggregate: " + func);
+            default -> throw new TrinoException(StandardErrorCode.NOT_SUPPORTED,
+                    "Prism Substrait serializer: unsupported aggregate function '" + func + "'");
         };
     }
 
