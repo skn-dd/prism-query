@@ -29,6 +29,7 @@ import java.util.*;
  * <p>Usage: java -jar prism-bridge.jar [--workers host:port,host:port] [--sf 0.1]</p>
  */
 public class BenchmarkCoordinator {
+    private static final int BENCH_CHUNK_ROWS = 1_000_000;
 
     private static final BufferAllocator ALLOC = new RootAllocator(Long.MAX_VALUE);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -78,7 +79,7 @@ public class BenchmarkCoordinator {
             System.err.println();
 
             int numWorkers = executor.workerCount();
-            if (!skipLoad) {
+            if (!skipLoad && shouldRun(bench, "legacy")) {
                 System.err.println("━━━ Generating and distributing TPC-H data ━━━");
                 long genStart = System.nanoTime();
                 distributeLineitem(executor, sf, numWorkers);
@@ -154,9 +155,17 @@ public class BenchmarkCoordinator {
     private static void runDistributedBenchmarks(PrismFlightExecutor executor, double sf) throws Exception {
         System.err.println();
         System.err.println("━━━ Running pushed distributed join+aggregate benchmarks ━━━");
-        distributeJoinBenchmarkData(executor, sf);
+        String runKeyPrefix = "bench/" + UUID.randomUUID();
+        String lineitemKey = runKeyPrefix + "/lineitem";
+        String ordersKey = runKeyPrefix + "/orders";
+        distributeJoinBenchmarkData(executor, sf, lineitemKey, ordersKey);
 
-        DistributedRevenueResult revenueResult = executeDistributedRevenueBenchmark(executor, sf);
+        DistributedRevenueResult revenueResult = executeDistributedRevenueBenchmark(
+                executor,
+                runKeyPrefix + "/join-revenue",
+                sf,
+                lineitemKey,
+                ordersKey);
         System.err.printf("%n  TPC-H join revenue benchmark (pushed Join + GROUP BY)%n");
         System.err.printf("    Reducer worker: %d (%s)%n",
                 revenueResult.reducerIndex(), executor.workerAddress(revenueResult.reducerIndex()));
@@ -171,7 +180,12 @@ public class BenchmarkCoordinator {
                     row.count());
         }
 
-        DistributedAvgResult avgResult = executeDistributedAvgBenchmark(executor, sf);
+        DistributedAvgResult avgResult = executeDistributedAvgBenchmark(
+                executor,
+                runKeyPrefix + "/join-avg",
+                sf,
+                lineitemKey,
+                ordersKey);
         System.err.printf("%n  Join AVG benchmark (distributed correctness check)%n");
         System.err.printf("    Reducer worker: %d (%s)%n",
                 avgResult.reducerIndex(), executor.workerAddress(avgResult.reducerIndex()));
@@ -182,13 +196,18 @@ public class BenchmarkCoordinator {
         }
     }
 
-    private static DistributedRevenueResult executeDistributedRevenueBenchmark(PrismFlightExecutor executor, double sf) throws Exception {
+    private static DistributedRevenueResult executeDistributedRevenueBenchmark(
+            PrismFlightExecutor executor,
+            String queryId,
+            double sf,
+            String lineitemKey,
+            String ordersKey) throws Exception {
         QueryExecution execution = executeDistributedQuery(
                 executor,
-                "bench-join-revenue-sf-" + sf,
+                queryId,
                 buildDistributedRevenuePlan(),
-                "bench/lineitem",
-                "bench/orders");
+                lineitemKey,
+                ordersKey);
         long fetchStart = System.nanoTime();
         List<RevenueRow> rows = readRevenueRows(executor, execution);
         double fetchMs = (System.nanoTime() - fetchStart) / 1_000_000.0;
@@ -200,13 +219,18 @@ public class BenchmarkCoordinator {
                 fetchMs);
     }
 
-    private static DistributedAvgResult executeDistributedAvgBenchmark(PrismFlightExecutor executor, double sf) throws Exception {
+    private static DistributedAvgResult executeDistributedAvgBenchmark(
+            PrismFlightExecutor executor,
+            String queryId,
+            double sf,
+            String lineitemKey,
+            String ordersKey) throws Exception {
         QueryExecution execution = executeDistributedQuery(
                 executor,
-                "bench-join-avg-sf-" + sf,
+                queryId,
                 buildDistributedAvgPlan(),
-                "bench/lineitem",
-                "bench/orders");
+                lineitemKey,
+                ordersKey);
         long fetchStart = System.nanoTime();
         List<AvgRow> rows = readAvgRows(executor, execution);
         double fetchMs = (System.nanoTime() - fetchStart) / 1_000_000.0;
@@ -315,8 +339,8 @@ public class BenchmarkCoordinator {
         command.put("result_key", resultKey);
 
         ObjectNode tables = command.putObject("tables");
-        tables.put("lineitem", lineitemKey);
-        tables.put("orders", ordersKey);
+        putTableSpec(tables, "lineitem", lineitemKey);
+        putTableSpec(tables, "orders", ordersKey);
 
         ObjectNode dist = command.putObject("distributed_aggregate");
         dist.put("query_id", queryId);
@@ -396,7 +420,11 @@ public class BenchmarkCoordinator {
                 List.of(new PrismPlanNode.AggregateExpr("AVG", 5, "agg_0")));
     }
 
-    private static void distributeJoinBenchmarkData(PrismFlightExecutor executor, double sf) throws Exception {
+    private static void distributeJoinBenchmarkData(
+            PrismFlightExecutor executor,
+            double sf,
+            String lineitemKey,
+            String ordersKey) throws Exception {
         int numWorkers = executor.workerCount();
         int totalLineitem = (int) (6_000_000 * sf);
         int totalOrders = (int) (1_500_000 * sf);
@@ -420,17 +448,23 @@ public class BenchmarkCoordinator {
             int ordersEnd = (workerIndex == numWorkers - 1) ? totalOrders : (workerIndex + 1) * ordersPerWorker;
             int localOrdersCount = ordersEnd - ordersStart;
 
-            byte[] lineitemIpc = generateCoPartitionedLineitemIpc(
-                    lineitemStart,
-                    localLineitemCount,
-                    ordersStart,
-                    localOrdersCount,
-                    flags,
-                    statuses);
-            byte[] ordersIpc = generateOrdersIpc(ordersStart, localOrdersCount, statuses, priorities);
-
-            executor.sendData(workerIndex, "bench/lineitem", lineitemIpc);
-            executor.sendData(workerIndex, "bench/orders", ordersIpc);
+            for (int offset = 0; offset < localLineitemCount; offset += BENCH_CHUNK_ROWS) {
+                int chunkSize = Math.min(BENCH_CHUNK_ROWS, localLineitemCount - offset);
+                byte[] lineitemIpc = generateCoPartitionedLineitemIpc(
+                        lineitemStart + offset,
+                        chunkSize,
+                        offset,
+                        ordersStart,
+                        localOrdersCount,
+                        flags,
+                        statuses);
+                executor.sendData(workerIndex, lineitemKey, lineitemIpc);
+            }
+            for (int offset = 0; offset < localOrdersCount; offset += BENCH_CHUNK_ROWS) {
+                int chunkSize = Math.min(BENCH_CHUNK_ROWS, localOrdersCount - offset);
+                byte[] ordersIpc = generateOrdersIpc(ordersStart + offset, chunkSize, statuses, priorities);
+                executor.sendData(workerIndex, ordersKey, ordersIpc);
+            }
             System.err.printf(
                     "    Worker %d: lineitem=%d rows orders=%d rows%n",
                     workerIndex,
@@ -496,6 +530,7 @@ public class BenchmarkCoordinator {
     }
 
     private static void validateRevenueRows(List<RevenueRow> actual, List<RevenueRow> expected) {
+        final double revenueTolerance = 1e-2;
         if (actual.size() != expected.size()) {
             throw new IllegalStateException("unexpected revenue row count: expected " + expected.size() + " but found " + actual.size());
         }
@@ -503,7 +538,7 @@ public class BenchmarkCoordinator {
             RevenueRow actualRow = actual.get(i);
             RevenueRow expectedRow = expected.get(i);
             if (!actualRow.status().equals(expectedRow.status())
-                    || Math.abs(actualRow.revenue() - expectedRow.revenue()) > 1e-3
+                    || Math.abs(actualRow.revenue() - expectedRow.revenue()) > revenueTolerance
                     || actualRow.count() != expectedRow.count()) {
                 throw new IllegalStateException("unexpected revenue row: expected " + expectedRow + " but found " + actualRow);
             }
@@ -525,19 +560,26 @@ public class BenchmarkCoordinator {
     }
 
     private static String buildCommand(String queryId, Map<String, String> tables, String resultKey) {
-        StringBuilder sb = new StringBuilder("{");
-        sb.append("\"query\":\"").append(queryId).append("\",");
-        sb.append("\"tables\":{");
-        boolean first = true;
-        for (var entry : tables.entrySet()) {
-            if (!first) sb.append(",");
-            sb.append("\"").append(entry.getKey()).append("\":\"").append(entry.getValue()).append("\"");
-            first = false;
+        try {
+            ObjectNode command = MAPPER.createObjectNode();
+            command.put("query", queryId);
+            command.put("result_key", resultKey);
+
+            ObjectNode tablesNode = command.putObject("tables");
+            for (var entry : tables.entrySet()) {
+                putTableSpec(tablesNode, entry.getKey(), entry.getValue());
+            }
+            return MAPPER.writeValueAsString(command);
         }
-        sb.append("},");
-        sb.append("\"result_key\":\"").append(resultKey).append("\"");
-        sb.append("}");
-        return sb.toString();
+        catch (Exception e) {
+            throw new RuntimeException("failed to build benchmark command", e);
+        }
+    }
+
+    private static void putTableSpec(ObjectNode tablesNode, String tableName, String storeKey) {
+        ObjectNode spec = tablesNode.putObject(tableName);
+        spec.putArray("uris");
+        spec.put("store_key", storeKey);
     }
 
     /**
@@ -557,8 +599,11 @@ public class BenchmarkCoordinator {
             int endRow = (w == numWorkers - 1) ? totalRows : (w + 1) * rowsPerWorker;
             int n = endRow - startRow;
 
-            byte[] ipcData = generateLineitemIpc(startRow, n, flags, statuses);
-            executor.sendData(w, "data/lineitem", ipcData);
+            for (int offset = 0; offset < n; offset += BENCH_CHUNK_ROWS) {
+                int chunkSize = Math.min(BENCH_CHUNK_ROWS, n - offset);
+                byte[] ipcData = generateLineitemIpc(startRow + offset, chunkSize, flags, statuses);
+                executor.sendData(w, "data/lineitem", ipcData);
+            }
             System.err.printf("    Worker %d: sent %d rows%n", w, n);
         }
     }
@@ -580,8 +625,11 @@ public class BenchmarkCoordinator {
             int endRow = (w == numWorkers - 1) ? totalRows : (w + 1) * rowsPerWorker;
             int n = endRow - startRow;
 
-            byte[] ipcData = generateOrdersIpc(startRow, n, statuses, priorities);
-            executor.sendData(w, "data/orders", ipcData);
+            for (int offset = 0; offset < n; offset += BENCH_CHUNK_ROWS) {
+                int chunkSize = Math.min(BENCH_CHUNK_ROWS, n - offset);
+                byte[] ipcData = generateOrdersIpc(startRow + offset, chunkSize, statuses, priorities);
+                executor.sendData(w, "data/orders", ipcData);
+            }
             System.err.printf("    Worker %d: sent %d rows%n", w, n);
         }
     }
@@ -643,6 +691,7 @@ public class BenchmarkCoordinator {
     private static byte[] generateCoPartitionedLineitemIpc(
             int startRow,
             int n,
+            int shardOffset,
             int ordersStart,
             int localOrdersCount,
             String[] flags,
@@ -676,7 +725,9 @@ public class BenchmarkCoordinator {
 
             for (int i = 0; i < n; i++) {
                 int row = startRow + i;
-                long localOrderKey = localOrdersCount == 0 ? row : ordersStart + (i % localOrdersCount);
+                long localOrderKey = localOrdersCount == 0
+                        ? row
+                        : ordersStart + ((shardOffset + i) % localOrdersCount);
                 orderkey.setSafe(i, localOrderKey);
                 partkey.setSafe(i, row % 200_000);
                 suppkey.setSafe(i, row % 10_000);

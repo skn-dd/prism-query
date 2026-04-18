@@ -22,6 +22,7 @@ class PrismMetadataProjectionTest {
     @Test
     void absorbsRenameOnlyProjectionOverJoinPlan() {
         PrismMetadata metadata = new PrismMetadata();
+        TestSession session = TestSession.withDefaults();
         PrismTableHandle handle = new PrismTableHandle("tpch", "lineitem").withPushedPlan(
                 new PrismPlanNode.Join(
                         metadata.buildFullScan("lineitem"),
@@ -33,7 +34,7 @@ class PrismMetadataProjectionTest {
         ProjectionInput input = buildRenameOnlyJoinProjection();
 
         Optional<ProjectionApplicationResult<ConnectorTableHandle>> result =
-                metadata.applyProjection(null, handle, input.projections(), input.assignments());
+                metadata.applyProjection(session, handle, input.projections(), input.assignments());
 
         assertTrue(result.isPresent(), "rename-only projection over join should be absorbed");
 
@@ -51,6 +52,7 @@ class PrismMetadataProjectionTest {
     @Test
     void convergesWhenSameColumnOnlyProjectionIsAlreadyPresent() {
         PrismMetadata metadata = new PrismMetadata();
+        TestSession session = TestSession.withDefaults();
         ProjectionInput input = buildRenameOnlyJoinProjection();
 
         List<Integer> allColumns = new ArrayList<>();
@@ -69,7 +71,7 @@ class PrismMetadataProjectionTest {
                         allColumns));
 
         Optional<ProjectionApplicationResult<ConnectorTableHandle>> result =
-                metadata.applyProjection(null, handle, input.projections(), input.assignments());
+                metadata.applyProjection(session, handle, input.projections(), input.assignments());
 
         assertTrue(result.isEmpty(), "identical column-only projection should converge");
     }

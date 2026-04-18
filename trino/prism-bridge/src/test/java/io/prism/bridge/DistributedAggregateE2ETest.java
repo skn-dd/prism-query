@@ -83,8 +83,8 @@ class DistributedAggregateE2ETest {
                     command.put("result_key", resultKeys[wi]);
 
                     ObjectNode tables = command.putObject("tables");
-                    tables.put("lineitem", "tpch/lineitem");
-                    tables.put("orders", "tpch/orders");
+                    putTableSpec(tables, "lineitem", "tpch/lineitem");
+                    putTableSpec(tables, "orders", "tpch/orders");
 
                     ObjectNode dist = command.putObject("distributed_aggregate");
                     dist.put("query_id", queryId);
@@ -179,8 +179,8 @@ class DistributedAggregateE2ETest {
                     command.put("result_key", resultKeys[wi]);
 
                     ObjectNode tables = command.putObject("tables");
-                    tables.put("lineitem", "tpch/lineitem");
-                    tables.put("orders", "tpch/orders");
+                    putTableSpec(tables, "lineitem", "tpch/lineitem");
+                    putTableSpec(tables, "orders", "tpch/orders");
 
                     ObjectNode dist = command.putObject("distributed_aggregate");
                     dist.put("query_id", queryId);
@@ -237,6 +237,12 @@ class DistributedAggregateE2ETest {
         assertTrue(actual != null, "missing reducer output row");
         assertEquals(expectedRevenue, actual.revenue, 1e-9);
         assertEquals(expectedCount, actual.count);
+    }
+
+    private static void putTableSpec(ObjectNode tablesNode, String tableName, String storeKey) {
+        ObjectNode spec = tablesNode.putObject(tableName);
+        spec.putArray("uris");
+        spec.put("store_key", storeKey);
     }
 
     private static double expectedRevenue(int startInclusive, int endExclusive) {
@@ -351,14 +357,21 @@ class DistributedAggregateE2ETest {
         command.put("row_count", rowCount);
         command.put("result_key", "result/" + UUID.randomUUID());
         ObjectNode tables = command.putObject("tables");
-        tables.put(table, "tpch/" + table);
+        putTableSpec(tables, table, "tpch/" + table);
         executor.executeQuery(workerIndex, MAPPER.writeValueAsString(command));
     }
 
     private static Process startWorker(Path workerBinary, int port, String logFileName) throws IOException {
         Path logDir = Paths.get("target", "worker-logs");
         Files.createDirectories(logDir);
-        ProcessBuilder builder = new ProcessBuilder(workerBinary.toString(), "--port", Integer.toString(port));
+        Path configPath = logDir.resolve(logFileName.replace(".log", ".toml"));
+        Files.writeString(configPath, "[tls]\nenabled = false\n");
+        ProcessBuilder builder = new ProcessBuilder(
+                workerBinary.toString(),
+                "--config",
+                configPath.toString(),
+                "--port",
+                Integer.toString(port));
         builder.redirectErrorStream(true);
         builder.redirectOutput(logDir.resolve(logFileName).toFile());
         return builder.start();

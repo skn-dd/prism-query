@@ -20,7 +20,7 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
         <configuration>
-          <argLine>-Dnet.bytebuddy.experimental=true</argLine>
+          <argLine>-Dnet.bytebuddy.experimental=true --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
         </configuration>
       </plugin>
       <plugin>

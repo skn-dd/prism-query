@@ -318,10 +318,6 @@ public class PrismFlightExecutor implements Closeable {
         return clients.size();
     }
 
-    public String workerAddress(int workerIndex) {
-        return workerAddresses.get(workerIndex);
-    }
-
     @Override
     public void close() {
         for (FlightClient client : clients) {
