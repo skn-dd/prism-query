@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{new_null_array, ArrayRef};
+use arrow_cast::cast;
 use arrow_schema::{Schema, SchemaRef};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
@@ -26,9 +27,11 @@ use crate::object_source::{list_files, parse_uri};
 
 /// Configuration for a Parquet table scan.
 pub struct ParquetScanConfig {
-    /// URI of a directory or single file. Schemes: `file://`, `s3://`,
-    /// `gs://`, `abfs[s]://`, or a bare local path.
-    pub uri: String,
+    /// List of URIs to scan. Each URI may reference a directory of Parquet
+    /// files or a single Parquet file. Schemes: `file://`, `s3://`, `gs://`,
+    /// `abfs[s]://`, or bare local paths. An empty list yields an empty
+    /// result (not an error) — the caller decides what to do.
+    pub uris: Vec<String>,
     /// Optional predicate for row group skipping.
     pub predicate: Option<Predicate>,
     /// Column projection — only read these column indices from Parquet.
@@ -39,23 +42,52 @@ pub struct ParquetScanConfig {
     /// If true, skip the expand_projected_batches step and return batches
     /// with only the projected columns. The caller must remap column indices.
     pub skip_expand: bool,
+    /// Optional target schema to unify batches across files with differing
+    /// schemas (schema evolution). When set, every file's batches are
+    /// adapted to this schema: missing columns become nulls, extra columns
+    /// are dropped, promotable types are cast, and column order is matched.
+    /// When `None`, the first file's schema is used as the reference.
+    pub target_schema: Option<SchemaRef>,
 }
 
 /// Scan Parquet files asynchronously, skipping row groups whose statistics
 /// prove the predicate cannot match.
 pub async fn parquet_scan(config: &ParquetScanConfig) -> Result<Vec<RecordBatch>> {
-    let (store, prefix) = parse_uri(&config.uri)?;
-    let files = list_files(&*store, &prefix, "parquet").await?;
-    if files.is_empty() {
-        return Err(PrismError::Internal(format!(
-            "no .parquet files found at {}",
-            config.uri
-        )));
+    if config.uris.is_empty() {
+        return Ok(Vec::new());
     }
 
-    // Peek at the first file for the full schema (used for projection-expansion).
-    let peek_meta = read_file_metadata(store.clone(), &files[0]).await?;
-    let full_schema: SchemaRef = peek_meta.schema().clone();
+    // Resolve every URI to a (store, file_path) pair. A URI may be a
+    // directory prefix (producing multiple files) or a single file.
+    let mut resolved: Vec<(Arc<dyn ObjectStore + 'static>, ObjectPath)> = Vec::new();
+    for uri in &config.uris {
+        let (store, prefix) = parse_uri(uri)?;
+        let files = list_files(&*store, &prefix, "parquet").await?;
+        if files.is_empty() {
+            return Err(PrismError::Internal(format!(
+                "no .parquet files found at {}",
+                uri
+            )));
+        }
+        for f in files {
+            resolved.push((store.clone(), f));
+        }
+    }
+
+    if resolved.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Peek at the first file for the full schema (used for projection-expansion
+    // when `target_schema` is None). When `target_schema` is set, we use it
+    // instead — it is the authoritative full-table schema across all files.
+    let full_schema: SchemaRef = match config.target_schema.clone() {
+        Some(ts) => ts,
+        None => {
+            let peek_meta = read_file_metadata(resolved[0].0.clone(), &resolved[0].1).await?;
+            peek_meta.schema().clone()
+        }
+    };
 
     // Per-file fan-out via tokio. We bound concurrency at num_cpus to mimic
     // the previous rayon behaviour without saturating the runtime.
@@ -63,20 +95,35 @@ pub async fn parquet_scan(config: &ParquetScanConfig) -> Result<Vec<RecordBatch>
     let predicate = config.predicate.clone();
     let projection = config.projection.clone();
     let batch_size = config.batch_size;
+    let target_schema = config.target_schema.clone();
+    let total_files = resolved.len();
 
     type FileResult = std::result::Result<(Vec<RecordBatch>, usize, usize), String>;
-    let file_results: Vec<FileResult> = stream::iter(files.iter().cloned())
-            .map(|file_path| {
-                let store = store.clone();
-                let predicate = predicate.clone();
-                let projection = projection.clone();
-                async move {
-                    read_parquet_file(store, file_path, predicate, projection, batch_size).await
-                }
-            })
-            .buffer_unordered(parallelism)
-            .collect()
-            .await;
+    // Pre-build each future eagerly so the adapter closure doesn't need to be
+    // generic over `dyn ObjectStore` lifetimes (which trips HRTB inference
+    // when this function is called from an async trait method).
+    let mut futures: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = FileResult> + Send>>> =
+        Vec::with_capacity(resolved.len());
+    for (store, file_path) in resolved.into_iter() {
+        let predicate = predicate.clone();
+        let projection = projection.clone();
+        let target_schema = target_schema.clone();
+        futures.push(Box::pin(async move {
+            read_parquet_file(
+                store,
+                file_path,
+                predicate,
+                projection,
+                batch_size,
+                target_schema,
+            )
+            .await
+        }));
+    }
+    let file_results: Vec<FileResult> = stream::iter(futures)
+        .buffer_unordered(parallelism)
+        .collect()
+        .await;
 
     let mut all_batches = Vec::new();
     let mut total_skipped = 0usize;
@@ -104,7 +151,7 @@ pub async fn parquet_scan(config: &ParquetScanConfig) -> Result<Vec<RecordBatch>
         total_skipped,
         all_batches.len(),
         proj_desc,
-        files.len(),
+        total_files,
     );
 
     // If projection was applied, expand batches back to the full schema
@@ -128,6 +175,7 @@ async fn read_parquet_file(
     predicate: Option<Predicate>,
     projection: Option<Vec<usize>>,
     batch_size: usize,
+    target_schema: Option<SchemaRef>,
 ) -> std::result::Result<(Vec<RecordBatch>, usize, usize), String> {
     // Build a ParquetObjectReader and load metadata.
     let reader = ParquetObjectReader::new(store, file_path.clone());
@@ -182,9 +230,23 @@ async fn read_parquet_file(
         .await
         .map_err(|e| format!("parquet read {}: {}", file_path, e))?;
     for batch in collected {
-        if batch.num_rows() > 0 {
-            batches.push(batch);
+        if batch.num_rows() == 0 {
+            continue;
         }
+        // Apply schema adaptation if a target schema was provided.
+        // With a projection the parent runs with `skip_expand` + external
+        // column remapping and expects file-native layout, so we intentionally
+        // skip adaptation in that case — schema evolution across projected
+        // columns must be handled at the Iceberg/Delta metadata layer (which
+        // is where column IDs live). For full scans, adapt here.
+        let out = if let (Some(ref ts), None) = (&target_schema, &projection) {
+            adapt_batch_to_schema(&batch, ts).map_err(|e| {
+                format!("adapt batch for {}: {}", file_path, e)
+            })?
+        } else {
+            batch
+        };
+        batches.push(out);
     }
 
     Ok((batches, skipped, num_row_groups))
@@ -192,24 +254,27 @@ async fn read_parquet_file(
 
 /// Get the total row count from Parquet metadata without reading any data.
 /// This is used for COUNT(*) optimization.
-pub async fn parquet_row_count(uri: &str, predicate: Option<&Predicate>) -> Result<usize> {
-    let (store, prefix) = parse_uri(uri)?;
-    let files = list_files(&*store, &prefix, "parquet").await?;
+pub async fn parquet_row_count(uris: Vec<String>, predicate: Option<&Predicate>) -> Result<usize> {
     let mut total = 0usize;
 
-    for file_path in &files {
-        let meta = read_file_metadata(store.clone(), file_path).await?;
-        let metadata = meta.metadata();
-        let schema = meta.schema();
+    for uri in &uris {
+        let (store, prefix) = parse_uri(uri)?;
+        let files = list_files(&*store, &prefix, "parquet").await?;
 
-        for i in 0..metadata.num_row_groups() {
-            let rg_meta = metadata.row_group(i);
-            let should_count = match predicate {
-                Some(pred) => row_group_might_match(pred, rg_meta, schema),
-                None => true,
-            };
-            if should_count {
-                total += rg_meta.num_rows() as usize;
+        for file_path in &files {
+            let meta = read_file_metadata(store.clone(), file_path).await?;
+            let metadata = meta.metadata();
+            let schema = meta.schema();
+
+            for i in 0..metadata.num_row_groups() {
+                let rg_meta = metadata.row_group(i);
+                let should_count = match predicate {
+                    Some(pred) => row_group_might_match(pred, rg_meta, schema),
+                    None => true,
+                };
+                if should_count {
+                    total += rg_meta.num_rows() as usize;
+                }
             }
         }
     }
@@ -231,6 +296,54 @@ fn num_cpus_or_default() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8)
+}
+
+/// Adapt a record batch so its schema matches `target`.
+///
+/// Rules (all applied in a single pass):
+/// - **Missing columns**: a field present in `target` but not in the batch
+///   becomes a null column of the target type.
+/// - **Extra columns**: a field present in the batch but not in `target` is
+///   dropped.
+/// - **Column ordering**: the output column order matches `target` exactly.
+/// - **Type promotion**: when a field name matches but the batch's data type
+///   differs, `arrow_cast::cast` is invoked. If the cast fails the caller
+///   gets a loud `PrismError::Internal` rather than silent miscomputation.
+pub fn adapt_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordBatch> {
+    let num_rows = batch.num_rows();
+    let src_schema = batch.schema();
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(target.fields().len());
+    for tgt_field in target.fields() {
+        let tgt_name = tgt_field.name();
+        let tgt_dtype = tgt_field.data_type();
+        match src_schema.index_of(tgt_name) {
+            Ok(src_idx) => {
+                let src_col = batch.column(src_idx);
+                if src_col.data_type() == tgt_dtype {
+                    columns.push(src_col.clone());
+                } else {
+                    let casted = cast(src_col.as_ref(), tgt_dtype).map_err(|e| {
+                        PrismError::Internal(format!(
+                            "adapt_batch_to_schema: cannot cast column '{}' from {:?} to {:?}: {}",
+                            tgt_name,
+                            src_col.data_type(),
+                            tgt_dtype,
+                            e
+                        ))
+                    })?;
+                    columns.push(casted);
+                }
+            }
+            Err(_) => {
+                // Missing column — inject nulls of the target type.
+                columns.push(new_null_array(tgt_dtype, num_rows));
+            }
+        }
+    }
+
+    RecordBatch::try_new(target.clone(), columns)
+        .map_err(|e| PrismError::Internal(format!("adapt_batch_to_schema: {}", e)))
 }
 
 /// Check if a row group might contain rows matching the predicate.
@@ -413,8 +526,11 @@ mod tests {
     use std::path::{Path as FsPath, PathBuf};
     use std::sync::Arc;
 
-    use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{
+        Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        TimestampMillisecondArray,
+    };
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::{ObjectStore, PutPayload};
@@ -480,6 +596,26 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// Write a parquet file with an arbitrary batch to the given in-memory store.
+    async fn put_parquet_batch(
+        store: &Arc<dyn ObjectStore>,
+        path: &str,
+        batch: &RecordBatch,
+    ) {
+        let mut buf: Vec<u8> = Vec::new();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        store
+            .put(&ObjectPath::from(path), PutPayload::from(buf))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_parquet_statistics_are_written() {
         let dir = PathBuf::from("/tmp/test_parquet_stats_written");
@@ -506,11 +642,12 @@ mod tests {
 
         let pred = Predicate::Lt(1, ScalarValue::Float64(150.0));
         let config = ParquetScanConfig {
-            uri: dir.to_string_lossy().into_owned(),
+            uris: vec![dir.to_string_lossy().into_owned()],
             predicate: Some(pred),
             projection: None,
             batch_size: 8192,
             skip_expand: false,
+            target_schema: None,
         };
 
         let batches = parquet_scan(&config).await.unwrap();
@@ -529,11 +666,12 @@ mod tests {
 
         let pred = Predicate::Eq(2, ScalarValue::Utf8("gamma".to_string()));
         let config = ParquetScanConfig {
-            uri: dir.to_string_lossy().into_owned(),
+            uris: vec![dir.to_string_lossy().into_owned()],
             predicate: Some(pred),
             projection: None,
             batch_size: 8192,
             skip_expand: false,
+            target_schema: None,
         };
 
         let batches = parquet_scan(&config).await.unwrap();
@@ -550,14 +688,17 @@ mod tests {
         let path = dir.join("test.parquet");
         write_test_parquet(&path, 100);
 
-        let count = parquet_row_count(dir.to_str().unwrap(), None).await.unwrap();
+        let count = parquet_row_count(vec![dir.to_string_lossy().into_owned()], None)
+            .await
+            .unwrap();
         assert_eq!(count, 500);
 
         // With predicate that skips some row groups
         let pred = Predicate::Lt(1, ScalarValue::Float64(150.0));
-        let count = parquet_row_count(dir.to_str().unwrap(), Some(&pred))
-            .await
-            .unwrap();
+        let count =
+            parquet_row_count(vec![dir.to_string_lossy().into_owned()], Some(&pred))
+                .await
+                .unwrap();
         assert_eq!(count, 200);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -591,12 +732,255 @@ mod tests {
             Some(predicate),
             None,
             8192,
+            None,
         )
         .await
         .unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 200);
         assert_eq!(total, 5);
-        assert!(skipped >= 3, "expected ≥3 skipped row groups, got {}", skipped);
+        assert!(skipped >= 3, "expected >=3 skipped row groups, got {}", skipped);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_scan_empty_uris_returns_empty() {
+        let config = ParquetScanConfig {
+            uris: Vec::new(),
+            predicate: None,
+            projection: None,
+            batch_size: 8192,
+            skip_expand: false,
+            target_schema: None,
+        };
+        let batches = parquet_scan(&config).await.unwrap();
+        assert!(batches.is_empty());
+    }
+
+    // --- adapt_batch_to_schema unit tests ---
+
+    #[test]
+    fn test_adapt_missing_column_injects_nulls() {
+        let src_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+        ]));
+        let src = RecordBatch::try_new(
+            src_schema,
+            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
+        )
+        .unwrap();
+
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let out = adapt_batch_to_schema(&src, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(out.num_columns(), 2);
+        let b = out.column(1);
+        assert_eq!(b.null_count(), 3);
+    }
+
+    #[test]
+    fn test_adapt_type_promotion_i32_to_i64() {
+        let src_schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, false),
+        ]));
+        let src = RecordBatch::try_new(
+            src_schema,
+            vec![Arc::new(Int32Array::from(vec![1i32, 2, 3]))],
+        )
+        .unwrap();
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, false),
+        ]));
+        let out = adapt_batch_to_schema(&src, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(col.values(), &[1i64, 2, 3]);
+    }
+
+    #[test]
+    fn test_adapt_type_promotion_date32_to_timestamp() {
+        let src_schema = Arc::new(Schema::new(vec![
+            Field::new("d", DataType::Date32, false),
+        ]));
+        // 0 = 1970-01-01, 1 = 1970-01-02
+        let src = RecordBatch::try_new(
+            src_schema,
+            vec![Arc::new(Date32Array::from(vec![0, 1]))],
+        )
+        .unwrap();
+        let target: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]));
+        let out = adapt_batch_to_schema(&src, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let ts = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        // 1970-01-02 in millis
+        assert_eq!(ts.value(1), 86_400_000);
+    }
+
+    #[test]
+    fn test_adapt_column_reordering() {
+        let src_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let src = RecordBatch::try_new(
+            src_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![10i64, 20])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .unwrap();
+
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Utf8, false),
+            Field::new("a", DataType::Int64, false),
+        ]));
+        let out = adapt_batch_to_schema(&src, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let b = out.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(b.value(0), "x");
+        let a = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(a.values(), &[10i64, 20]);
+    }
+
+    #[test]
+    fn test_adapt_drops_extra_columns() {
+        let src_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("extra", DataType::Utf8, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let src = RecordBatch::try_new(
+            src_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2])),
+                Arc::new(StringArray::from(vec!["drop", "me"])),
+                Arc::new(Int64Array::from(vec![10i64, 20])),
+            ],
+        )
+        .unwrap();
+
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let out = adapt_batch_to_schema(&src, &target).unwrap();
+        assert_eq!(out.num_columns(), 2);
+        assert_eq!(out.schema(), target);
+    }
+
+    #[test]
+    fn test_adapt_invalid_cast_errors() {
+        let src_schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let src = RecordBatch::try_new(
+            src_schema,
+            vec![Arc::new(StringArray::from(vec!["not-a-number"]))],
+        )
+        .unwrap();
+        // arrow_cast will fail to parse "not-a-number" as Int64 with safe=true.
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Int64, false),
+        ]));
+        let result = adapt_batch_to_schema(&src, &target);
+        assert!(result.is_err(), "expected invalid cast to fail loudly");
+    }
+
+    /// Scan across two files with differing schemas (schema evolution),
+    /// target_schema specified, verify unified batches.
+    #[tokio::test]
+    async fn test_parquet_scan_multi_uri_schema_evolution() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // File A: columns [id Int32, name Utf8]
+        let schema_a = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch_a = RecordBatch::try_new(
+            schema_a,
+            vec![
+                Arc::new(Int32Array::from(vec![1i32, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        put_parquet_batch(&store, "data/file_a.parquet", &batch_a).await;
+
+        // File B: columns [id Int64, name Utf8, value Float64] — new column + promoted id
+        let schema_b = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let batch_b = RecordBatch::try_new(
+            schema_b,
+            vec![
+                Arc::new(Int64Array::from(vec![3i64, 4])),
+                Arc::new(StringArray::from(vec!["c", "d"])),
+                Arc::new(Float64Array::from(vec![1.5, 2.5])),
+            ],
+        )
+        .unwrap();
+        put_parquet_batch(&store, "data/file_b.parquet", &batch_b).await;
+
+        // Target schema — unified view: id Int64, name Utf8, value Float64
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        // We scan through InMemory via memory URIs. Each file is wrapped by
+        // going through parse_uri with its memory:// equivalent, but parse_uri
+        // doesn't support memory://. Instead, exercise read_parquet_file
+        // directly for each file with the target schema applied.
+
+        let files = [
+            ObjectPath::from("data/file_a.parquet"),
+            ObjectPath::from("data/file_b.parquet"),
+        ];
+        let mut all = Vec::new();
+        for f in files {
+            let (batches, _s, _t) = read_parquet_file(
+                store.clone(),
+                f,
+                None,
+                None,
+                8192,
+                Some(target.clone()),
+            )
+            .await
+            .unwrap();
+            all.extend(batches);
+        }
+
+        assert_eq!(all.len(), 2);
+        for b in &all {
+            assert_eq!(b.schema(), target);
+        }
+        // File A's 'value' column should be all nulls.
+        assert_eq!(all[0].column(2).null_count(), 2);
+        // File A's id cast to Int64
+        let id_a = all[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_a.values(), &[1i64, 2]);
+        // File B unchanged
+        assert_eq!(all[1].column(2).null_count(), 0);
     }
 }

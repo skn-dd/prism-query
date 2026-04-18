@@ -65,39 +65,33 @@ impl ActionHandler for QueryHandler {
             // Fast path: unfiltered COUNT(*) from Parquet metadata only (no data reading).
             // Only used when there is NO predicate — filtered COUNT(*) must go through
             // the executor for exact results (row-group skipping only gives an overestimate).
-            if let Some(data_dir) = self.data_dir.as_deref() {
-                if let Some((table_name, pred)) = detect_count_star(&plan.root) {
-                    if pred.is_none() {
-                        if let Some(store_key) = command["tables"]
-                            .as_object()
-                            .and_then(|m| m.get(&table_name))
-                            .and_then(|v| v.as_str())
-                        {
-                            let parquet_dir = data_dir.join(store_key);
-                            if parquet_dir.exists() {
-                                let uri = parquet_dir.to_string_lossy().into_owned();
-                                let count = parquet_row_count(
-                                    &uri,
-                                    None,
-                                ).await
-                                 .map_err(|e| anyhow::anyhow!("Parquet row count error: {}", e))?;
+            if let Some((table_name, pred)) = detect_count_star(&plan.root) {
+                if pred.is_none() {
+                    if let Some(spec) = command["tables"]
+                        .as_object()
+                        .and_then(|m| m.get(&table_name))
+                    {
+                        let uris = resolve_table_uris(spec, self.data_dir.as_deref());
+                        if !uris.is_empty() {
+                            let count = parquet_row_count(uris, None)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Parquet row count error: {}", e))?;
 
-                                tracing::info!(
-                                    "COUNT(*) metadata shortcut for '{}': {} rows in {:.2}ms",
-                                    table_name,
-                                    count,
-                                    start.elapsed().as_secs_f64() * 1000.0,
-                                );
+                            tracing::info!(
+                                "COUNT(*) metadata shortcut for '{}': {} rows in {:.2}ms",
+                                table_name,
+                                count,
+                                start.elapsed().as_secs_f64() * 1000.0,
+                            );
 
-                                let schema = Arc::new(Schema::new(vec![
-                                    Field::new(&plan.root.aggregate_output_name().unwrap_or("cnt".into()),
-                                               DataType::Int64, true),
-                                ]));
-                                return Ok(RecordBatch::try_new(
-                                    schema,
-                                    vec![Arc::new(Int64Array::from(vec![count as i64]))],
-                                )?);
-                            }
+                            let schema = Arc::new(Schema::new(vec![
+                                Field::new(&plan.root.aggregate_output_name().unwrap_or("cnt".into()),
+                                           DataType::Int64, true),
+                            ]));
+                            return Ok(RecordBatch::try_new(
+                                schema,
+                                vec![Arc::new(Int64Array::from(vec![count as i64]))],
+                            )?);
                         }
                     }
                 }
@@ -307,8 +301,87 @@ impl QueryHandler {
     }
 }
 
-/// Load tables with Parquet support. Checks for Parquet files first,
-/// falls back to PartitionStore.
+/// Table specification as delivered in the v2 DoAction protocol.
+/// Each entry in `tables` is an object: `{ "uris": [...], "store_key": "..." }`.
+/// - `uris` (required, may be empty): fully-qualified Parquet file or directory
+///   URIs (`file://`, `s3://`, `gs://`, `abfs[s]://`, or bare local paths).
+/// - `store_key` (optional): legacy fallback used when `uris` is empty — the
+///   worker resolves the table either from the `{--data-dir}/{store_key}/`
+///   Parquet tree (bench scenarios) or from the in-memory `PartitionStore`
+///   (DoPut-pushed tables from tests).
+///
+/// We deliberately do NOT support the old bare-string form; the only in-tree
+/// caller is Prism itself and the brief requires a clean break.
+#[derive(Debug, Default)]
+struct TableSpec {
+    uris: Vec<String>,
+    store_key: Option<String>,
+}
+
+fn parse_table_spec(name: &str, v: &serde_json::Value) -> anyhow::Result<TableSpec> {
+    let obj = v.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "table '{}' must be an object of the form {{\"uris\": [...], \"store_key\": \"...\"}}",
+            name
+        )
+    })?;
+
+    let uris = match obj.get("uris") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| anyhow::anyhow!("table '{}' uris must be strings", name))
+            })
+            .collect::<anyhow::Result<Vec<String>>>()?,
+        Some(_) => {
+            return Err(anyhow::anyhow!(
+                "table '{}' 'uris' field must be a JSON array",
+                name
+            ))
+        }
+        None => Vec::new(),
+    };
+    let store_key = obj
+        .get("store_key")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if uris.is_empty() && store_key.is_none() {
+        return Err(anyhow::anyhow!(
+            "table '{}' must have either non-empty 'uris' or a 'store_key'",
+            name
+        ));
+    }
+    Ok(TableSpec { uris, store_key })
+}
+
+/// Resolve a table spec to the URI list we will scan. Used by the COUNT(*)
+/// metadata shortcut. Returns URIs derived from either the explicit `uris`
+/// list or — for the bench legacy path — `data_dir.join(store_key)`.
+fn resolve_table_uris(v: &serde_json::Value, data_dir: Option<&Path>) -> Vec<String> {
+    let spec = match parse_table_spec("<count-star>", v) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    if !spec.uris.is_empty() {
+        return spec.uris;
+    }
+    if let (Some(dir), Some(key)) = (data_dir, spec.store_key.as_deref()) {
+        let path = dir.join(key);
+        if path.exists() {
+            return vec![path.to_string_lossy().into_owned()];
+        }
+    }
+    Vec::new()
+}
+
+/// Load tables with Parquet support. Uses the v2 per-table spec
+/// `{ uris: [...], store_key?: "..." }`. When `uris` is non-empty, every URI
+/// is scanned as Parquet. Otherwise we fall back to `{data_dir}/{store_key}/`
+/// or the in-memory `PartitionStore`.
+///
 /// Returns the tables AND column remap mappings (orig_col_idx -> projected_col_idx)
 /// for each table that was loaded with projection + skip_expand.
 async fn load_tables_smart(
@@ -324,64 +397,80 @@ async fn load_tables_smart(
     let mut tables: HashMap<String, Vec<RecordBatch>> = HashMap::new();
     let mut col_remaps: HashMap<String, HashMap<usize, usize>> = HashMap::new();
 
-    for (name, key_val) in tables_map {
-        let key = key_val
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("table key must be a string"))?;
+    for (name, spec_val) in tables_map {
+        let spec = parse_table_spec(name, spec_val)?;
 
-        // Try Parquet path first
-        if let Some(dir) = data_dir {
+        // Pick the URI list to scan. Priority:
+        //   1. explicit `uris` from the coordinator (delegation-driven)
+        //   2. `{data_dir}/{store_key}/` (legacy bench Parquet path)
+        let scan_uris: Vec<String> = if !spec.uris.is_empty() {
+            spec.uris.clone()
+        } else if let (Some(dir), Some(key)) = (data_dir, spec.store_key.as_deref()) {
             let parquet_dir = dir.join(key);
             if parquet_dir.exists() {
-                let hint = hints.get(name.as_str());
-                let predicate = hint.and_then(|h| h.predicate.clone());
-
-                // Column pruning: only read columns the query actually needs
-                let projection = hint.and_then(|h| h.projection.clone());
-
-                // Use skip_expand for all queries — multi-table JOINs are handled
-                // via per-subtree column remapping in remap_plan_multi_table
-                let has_projection = projection.is_some();
-
-                let start = Instant::now();
-                let uri = parquet_dir.to_string_lossy().into_owned();
-                let batches = parquet_scan(&ParquetScanConfig {
-                    uri,
-                    predicate,
-                    projection: projection.clone(),
-                    batch_size: 1_048_576,
-                    skip_expand: has_projection,
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("Parquet scan error for '{}': {}", name, e))?;
-
-                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-                tracing::info!(
-                    "Loaded '{}' from Parquet: {} rows in {:.1}ms",
-                    name,
-                    rows,
-                    start.elapsed().as_secs_f64() * 1000.0,
-                );
-
-                // Build column remap: original_col_idx -> projected_batch_col_idx
-                if let Some(ref proj_cols) = projection {
-                    let mut remap: HashMap<usize, usize> = HashMap::new();
-                    for (batch_idx, &orig_idx) in proj_cols.iter().enumerate() {
-                        remap.insert(orig_idx, batch_idx);
-                    }
-                    col_remaps.insert(name.clone(), remap);
-                }
-
-                tables.insert(name.clone(), batches);
-                continue;
+                vec![parquet_dir.to_string_lossy().into_owned()]
+            } else {
+                Vec::new()
             }
+        } else {
+            Vec::new()
+        };
+
+        if !scan_uris.is_empty() {
+            let hint = hints.get(name.as_str());
+            let predicate = hint.and_then(|h| h.predicate.clone());
+
+            // Column pruning: only read columns the query actually needs
+            let projection = hint.and_then(|h| h.projection.clone());
+
+            // Use skip_expand for all queries — multi-table JOINs are handled
+            // via per-subtree column remapping in remap_plan_multi_table
+            let has_projection = projection.is_some();
+
+            let start = Instant::now();
+            let batches = parquet_scan(&ParquetScanConfig {
+                uris: scan_uris,
+                predicate,
+                projection: projection.clone(),
+                batch_size: 1_048_576,
+                skip_expand: has_projection,
+                target_schema: None,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Parquet scan error for '{}': {}", name, e))?;
+
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            tracing::info!(
+                "Loaded '{}' from Parquet: {} rows in {:.1}ms",
+                name,
+                rows,
+                start.elapsed().as_secs_f64() * 1000.0,
+            );
+
+            // Build column remap: original_col_idx -> projected_batch_col_idx
+            if let Some(ref proj_cols) = projection {
+                let mut remap: HashMap<usize, usize> = HashMap::new();
+                for (batch_idx, &orig_idx) in proj_cols.iter().enumerate() {
+                    remap.insert(orig_idx, batch_idx);
+                }
+                col_remaps.insert(name.clone(), remap);
+            }
+
+            tables.insert(name.clone(), batches);
+            continue;
         }
 
-        // Fall back to in-memory PartitionStore
+        // Fall back to in-memory PartitionStore — requires a store_key.
+        let key = spec.store_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "table '{}' has empty 'uris' and no 'store_key' — cannot resolve",
+                name
+            )
+        })?;
         let batches = store.get(key).await;
         if batches.is_empty() {
             return Err(anyhow::anyhow!(
-                "table '{}' (key '{}') not found in store or Parquet",
+                "table '{}' (store_key '{}') not found in store or Parquet",
                 name,
                 key
             ));
@@ -605,6 +694,9 @@ fn remap_expr_local(
 
 /// Load tables from the partition store, concatenating all chunks into single RecordBatches.
 /// Used by the legacy hardcoded query path which expects single RecordBatch per table.
+///
+/// This path is in-memory only (DoPut-pushed data); it accepts the v2 per-table
+/// spec but requires `store_key` to be set.
 async fn load_tables(
     command: &serde_json::Value,
     store: &PartitionStore,
@@ -614,14 +706,18 @@ async fn load_tables(
         .ok_or_else(|| anyhow::anyhow!("missing 'tables' field"))?;
 
     let mut tables: HashMap<String, RecordBatch> = HashMap::new();
-    for (name, key_val) in tables_map {
-        let key = key_val
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("table key must be a string"))?;
+    for (name, spec_val) in tables_map {
+        let spec = parse_table_spec(name, spec_val)?;
+        let key = spec.store_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "legacy load_tables requires 'store_key' on table '{}'",
+                name
+            )
+        })?;
         let batches = store.get(key).await;
         if batches.is_empty() {
             return Err(anyhow::anyhow!(
-                "table '{}' (key '{}') not found in store",
+                "table '{}' (store_key '{}') not found in store",
                 name,
                 key
             ));
@@ -631,4 +727,120 @@ async fn load_tables(
         tables.insert(name.clone(), merged);
     }
     Ok(tables)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Float64Array, Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+    use serde_json::json;
+
+    fn sample_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// v2 protocol — `uris` is empty and `store_key` points to an in-memory
+    /// table pushed via `DoPut`. This mirrors the DoPut-driven bench path.
+    #[tokio::test]
+    async fn test_protocol_v2_store_key_fallback() {
+        let store = PartitionStore::new();
+        store.put("memtable/x", sample_batch()).await;
+
+        let command = json!({
+            "tables": {
+                "x": { "uris": [], "store_key": "memtable/x" }
+            }
+        });
+
+        let hints: HashMap<String, ScanHint> = HashMap::new();
+        let (tables, remaps) =
+            load_tables_smart(&command, &store, None, &hints).await.unwrap();
+        assert_eq!(tables.len(), 1);
+        assert!(remaps.is_empty());
+        let batches = tables.get("x").unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 3);
+
+        // Equivalently via the legacy hardcoded path.
+        let legacy = load_tables(&command, &store).await.unwrap();
+        assert_eq!(legacy.get("x").unwrap().num_rows(), 3);
+    }
+
+    /// v2 protocol — `uris` populated, no `store_key`. Simulates the
+    /// delegation-driven path where the coordinator sends real file URIs.
+    /// We use a local `file://`-compatible temp directory so the URI goes
+    /// through the full `object_store` pathway just like S3 would.
+    #[tokio::test]
+    async fn test_protocol_v2_uri_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("t.parquet");
+        // Write a parquet file that the scan can read.
+        let batch = sample_batch();
+        let mut buf: Vec<u8> = Vec::new();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        {
+            let mut w = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        std::fs::write(&file_path, &buf).unwrap();
+
+        // Empty PartitionStore — scan must reach Parquet via URIs only.
+        let store = PartitionStore::new();
+        let command = json!({
+            "tables": {
+                "x": {
+                    "uris": [file_path.to_string_lossy()],
+                    // deliberately no store_key
+                }
+            }
+        });
+
+        let hints: HashMap<String, ScanHint> = HashMap::new();
+        let (tables, _remaps) =
+            load_tables_smart(&command, &store, None, &hints).await.unwrap();
+
+        let batches = tables.get("x").unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 3);
+    }
+
+    /// v2 protocol rejects bare-string tables values (the old protocol) with
+    /// a clear error. This enforces the "no backward-compat shim" rule.
+    #[tokio::test]
+    async fn test_protocol_v2_rejects_old_bare_string() {
+        let store = PartitionStore::new();
+        store.put("tpch/lineitem", sample_batch()).await;
+        let command = json!({ "tables": { "lineitem": "tpch/lineitem" } });
+
+        let hints: HashMap<String, ScanHint> = HashMap::new();
+        let err = load_tables_smart(&command, &store, None, &hints)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must be an object"),
+            "expected v2 parse error, got: {}",
+            err
+        );
+    }
 }

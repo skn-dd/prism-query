@@ -178,7 +178,7 @@ public class PrismPageSource implements ConnectorPageSource {
         String[] resultKeys = new String[workerCount];
 
         ObjectNode tablesTemplate = MAPPER.createObjectNode();
-        tablesTemplate.put(tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
+        putTableSpec(tablesTemplate, tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
         addJoinTables(plan, tablesTemplate);
 
         // Execute on all workers in parallel
@@ -274,7 +274,7 @@ public class PrismPageSource implements ConnectorPageSource {
 
         // Build table mapping
         ObjectNode tablesTemplate = MAPPER.createObjectNode();
-        tablesTemplate.put(tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
+        putTableSpec(tablesTemplate, tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
         addJoinTables(plan, tablesTemplate);
 
         // Execute on all workers in parallel
@@ -371,7 +371,7 @@ public class PrismPageSource implements ConnectorPageSource {
         String[] resultKeys = new String[workerCount];
 
         ObjectNode tablesTemplate = MAPPER.createObjectNode();
-        tablesTemplate.put(tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
+        putTableSpec(tablesTemplate, tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
         addJoinTables(plan, tablesTemplate);
 
         // Execute on all workers in parallel
@@ -646,7 +646,7 @@ public class PrismPageSource implements ConnectorPageSource {
         command.put("result_key", resultKey);
 
         ObjectNode tablesNode = command.putObject("tables");
-        tablesNode.put(tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
+        putTableSpec(tablesNode, tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
         addJoinTables(plan, tablesNode);
 
         executor.executeQuery(split.getWorkerIndex(), MAPPER.writeValueAsString(command));
@@ -684,10 +684,32 @@ public class PrismPageSource implements ConnectorPageSource {
         } else if (node instanceof PrismPlanNode.Sort sort) {
             addJoinTablesImpl(sort.input(), tablesNode, broadcast);
         } else if (node instanceof PrismPlanNode.Scan scan) {
-            String path = broadcast
+            String storeKey = broadcast
                     ? "tpch/" + scan.tableName() + "_broadcast"
                     : "tpch/" + scan.tableName();
-            tablesNode.put(scan.tableName(), path);
+            putTableSpec(tablesNode, scan.tableName(), storeKey);
         }
+    }
+
+    /**
+     * Write a v2 table spec entry into the `tables` JSON map.
+     *
+     * Protocol v2 (Wave 2a):
+     * {@code "<name>": { "uris": [...], "store_key": "<legacy>" } }
+     *
+     * For the TPC-H bench path, {@code uris} is empty and the worker resolves
+     * the table via {@code --data-dir/<store_key>/} (legacy Parquet on disk)
+     * or the in-memory PartitionStore. Once metadata delegation lands in
+     * Wave 2b, {@code uris} will be populated with fully-qualified file URIs
+     * (s3://, file://, etc.) and {@code store_key} will be omitted.
+     *
+     * The JSON-object shape leaves room for future fields (schema, format,
+     * ...) without another breaking protocol change.
+     */
+    // package-private for unit testing
+    static void putTableSpec(ObjectNode tablesNode, String tableName, String storeKey) {
+        ObjectNode spec = tablesNode.putObject(tableName);
+        spec.putArray("uris");
+        spec.put("store_key", storeKey);
     }
 }
