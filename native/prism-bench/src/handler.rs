@@ -4,14 +4,23 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::FlightDescriptor;
 use arrow_schema::{DataType, Field, Schema};
 use base64::Engine;
+use futures::{stream, TryStreamExt};
+use serde::Deserialize;
+use tonic::transport::Channel;
 
+use prism_executor::hash_aggregate::{AggExpr, AggFunc, HashAggConfig};
 use prism_executor::parquet_scan::{ParquetScanConfig, parquet_scan, parquet_row_count};
 use prism_flight::shuffle_writer::{ActionHandler, PartitionStore};
+use prism_substrait::plan::PlanNode;
 use prism_substrait::plan_opt::{ScanHint, extract_scan_hints, extract_projection_hints, detect_count_star};
 
 use crate::{datagen, queries};
@@ -36,6 +45,31 @@ impl QueryHandler {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct DistributedAggregateCommand {
+    query_id: String,
+    role: String,
+    worker_index: usize,
+    reducer_index: usize,
+    reducer_endpoint: String,
+    expected_workers: usize,
+    timeout_ms: Option<u64>,
+}
+
+impl DistributedAggregateCommand {
+    fn is_reducer(&self) -> bool {
+        self.role == "reducer"
+    }
+
+    fn partial_key(&self, worker_index: usize) -> String {
+        format!("__partialagg/{}/{}", self.query_id, worker_index)
+    }
+
+    fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.unwrap_or(30_000))
+    }
+}
+
 #[tonic::async_trait]
 impl ActionHandler for QueryHandler {
     async fn execute(
@@ -57,9 +91,14 @@ impl ActionHandler for QueryHandler {
             let mut hints = extract_scan_hints(&plan.root);
             extract_projection_hints(&plan.root, &mut hints);
 
-            tracing::info!("DBG_PLAN: {:#?}", plan.root);
+            tracing::debug!("executing plan: {:#?}", plan.root);
             for (t, h) in &hints {
-                tracing::info!("DBG_HINT: table={} projection={:?} predicate={:?}", t, h.projection, h.predicate);
+                tracing::debug!(
+                    "scan hint: table={} projection={:?} predicate={:?}",
+                    t,
+                    h.projection,
+                    h.predicate
+                );
             }
 
             // Fast path: unfiltered COUNT(*) from Parquet metadata only (no data reading).
@@ -102,8 +141,27 @@ impl ActionHandler for QueryHandler {
             for (t, batches) in &tables {
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 let cols = batches.first().map(|b| b.num_columns()).unwrap_or(0);
-                let schema_str = batches.first().map(|b| format!("{:?}", b.schema().fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>())).unwrap_or_default();
-                tracing::info!("DBG_LOAD: table={} rows={} cols={} nbatches={} schema={}", t, rows, cols, batches.len(), schema_str);
+                let schema_str = batches
+                    .first()
+                    .map(|b| {
+                        format!(
+                            "{:?}",
+                            b.schema()
+                                .fields()
+                                .iter()
+                                .map(|f| f.name().clone())
+                                .collect::<Vec<_>>()
+                        )
+                    })
+                    .unwrap_or_default();
+                tracing::debug!(
+                    "loaded table={} rows={} cols={} nbatches={} schema={}",
+                    t,
+                    rows,
+                    cols,
+                    batches.len(),
+                    schema_str
+                );
             }
 
             // Remap column indices for projected Parquet loading with skip_expand.
@@ -113,8 +171,19 @@ impl ActionHandler for QueryHandler {
                 remap_plan_multi_table(&mut plan_root, &col_remaps);
             }
 
-            let result = prism_substrait::executor::execute_plan_chunked(&plan_root, &tables)
-                .map_err(|e| anyhow::anyhow!("Substrait execute error: {}", e))?;
+            let distributed = command
+                .get("distributed_aggregate")
+                .cloned()
+                .map(serde_json::from_value::<DistributedAggregateCommand>)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("distributed aggregate command error: {}", e))?;
+
+            let result = if let Some(dist) = distributed.as_ref() {
+                execute_distributed_aggregate(&plan_root, &tables, store, dist).await?
+            } else {
+                prism_substrait::executor::execute_plan_chunked(&plan_root, &tables)
+                    .map_err(|e| anyhow::anyhow!("Substrait execute error: {}", e))?
+            };
             let elapsed = start.elapsed();
 
             let total_rows: usize = tables
@@ -180,6 +249,373 @@ impl ActionHandler for QueryHandler {
 
         Ok(result)
     }
+}
+
+async fn execute_distributed_aggregate(
+    plan_root: &PlanNode,
+    tables: &HashMap<String, Vec<RecordBatch>>,
+    store: &PartitionStore,
+    command: &DistributedAggregateCommand,
+) -> anyhow::Result<RecordBatch> {
+    let (group_by, original_aggs) = find_aggregate(plan_root)
+        .ok_or_else(|| anyhow::anyhow!("distributed aggregate requested for non-aggregate plan"))?;
+    let (worker_aggs, agg_mapping) = expand_worker_aggregates(&original_aggs);
+    let worker_plan = replace_aggregates(plan_root, &worker_aggs)?;
+
+    let local_partial = prism_substrait::executor::execute_plan_chunked(&worker_plan, tables)
+        .map_err(|e| anyhow::anyhow!("Substrait distributed partial execute error: {}", e))?;
+
+    if !command.is_reducer() {
+        let partial_rows = local_partial.num_rows();
+        let partial_bytes: usize = local_partial
+            .columns()
+            .iter()
+            .map(|col| col.get_array_memory_size())
+            .sum();
+        let send_start = Instant::now();
+        tracing::info!(
+            "distributed aggregate producer {} sending {} rows ({} bytes) to reducer {}",
+            command.worker_index,
+            partial_rows,
+            partial_bytes,
+            command.reducer_index,
+        );
+        send_partial_batch(
+            &command.reducer_endpoint,
+            &command.partial_key(command.worker_index),
+            local_partial.clone(),
+        )
+        .await?;
+        tracing::info!(
+            "distributed aggregate producer {} sent partial batch in {:.2}ms",
+            command.worker_index,
+            send_start.elapsed().as_secs_f64() * 1000.0,
+        );
+        return Ok(RecordBatch::new_empty(local_partial.schema()));
+    }
+
+    let peer_keys: Vec<String> = (0..command.expected_workers)
+        .filter(|idx| *idx != command.worker_index)
+        .map(|idx| command.partial_key(idx))
+        .collect();
+    let mut partial_batches = vec![local_partial];
+    let wait_start = Instant::now();
+    partial_batches.extend(wait_for_partial_batches(store, &peer_keys, command.timeout()).await?);
+    tracing::info!(
+        "distributed aggregate reducer {} waited {:.2}ms for {} peer partial batch(es)",
+        command.worker_index,
+        wait_start.elapsed().as_secs_f64() * 1000.0,
+        partial_batches.len().saturating_sub(1),
+    );
+
+    let merge_config = build_final_merge_config(group_by.len(), &worker_aggs)?;
+    let merged_worker_batch = prism_executor::hash_aggregate::hash_aggregate_batches(
+        &partial_batches,
+        &merge_config,
+    )?;
+
+    tracing::info!(
+        "distributed aggregate reducer {} merged {} partial batches into {} rows",
+        command.worker_index,
+        partial_batches.len(),
+        merged_worker_batch.num_rows(),
+    );
+
+    reconstruct_original_aggregate_batch(
+        &merged_worker_batch,
+        group_by.len(),
+        &original_aggs,
+        &agg_mapping,
+    )
+}
+
+fn find_aggregate(node: &PlanNode) -> Option<(Vec<usize>, Vec<AggExpr>)> {
+    match node {
+        PlanNode::Aggregate {
+            group_by,
+            aggregates,
+            ..
+        } => Some((group_by.clone(), aggregates.clone())),
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Sort { input, .. } => find_aggregate(input),
+        _ => None,
+    }
+}
+
+fn replace_aggregates(node: &PlanNode, new_aggs: &[AggExpr]) -> anyhow::Result<PlanNode> {
+    match node {
+        PlanNode::Aggregate { input, group_by, .. } => Ok(PlanNode::Aggregate {
+            input: input.clone(),
+            group_by: group_by.clone(),
+            aggregates: new_aggs.to_vec(),
+        }),
+        PlanNode::Filter { input, predicate } => Ok(PlanNode::Filter {
+            input: Box::new(replace_aggregates(input, new_aggs)?),
+            predicate: predicate.clone(),
+        }),
+        PlanNode::Project {
+            input,
+            columns,
+            expressions,
+        } => Ok(PlanNode::Project {
+            input: Box::new(replace_aggregates(input, new_aggs)?),
+            columns: columns.clone(),
+            expressions: expressions.clone(),
+        }),
+        PlanNode::Sort {
+            input,
+            sort_keys,
+            limit,
+        } => Ok(PlanNode::Sort {
+            input: Box::new(replace_aggregates(input, new_aggs)?),
+            sort_keys: sort_keys.clone(),
+            limit: *limit,
+        }),
+        _ => Err(anyhow::anyhow!(
+            "distributed aggregate expects Aggregate at root or below filter/project/sort"
+        )),
+    }
+}
+
+fn expand_worker_aggregates(original: &[AggExpr]) -> (Vec<AggExpr>, Vec<Vec<usize>>) {
+    let mut worker_aggs = Vec::new();
+    let mut agg_mapping = Vec::with_capacity(original.len());
+
+    for agg in original {
+        if agg.func == AggFunc::Avg {
+            let sum_idx = worker_aggs.len();
+            worker_aggs.push(AggExpr {
+                column: agg.column,
+                func: AggFunc::Sum,
+                output_name: format!("agg_{}", sum_idx),
+            });
+            let count_idx = worker_aggs.len();
+            worker_aggs.push(AggExpr {
+                column: agg.column,
+                func: AggFunc::Count,
+                output_name: format!("agg_{}", count_idx),
+            });
+            agg_mapping.push(vec![sum_idx, count_idx]);
+        } else {
+            let idx = worker_aggs.len();
+            worker_aggs.push(AggExpr {
+                column: agg.column,
+                func: agg.func,
+                output_name: format!("agg_{}", idx),
+            });
+            agg_mapping.push(vec![idx]);
+        }
+    }
+
+    (worker_aggs, agg_mapping)
+}
+
+fn build_final_merge_config(
+    group_by_count: usize,
+    worker_aggs: &[AggExpr],
+) -> anyhow::Result<HashAggConfig> {
+    let mut aggregates = Vec::with_capacity(worker_aggs.len());
+    for (idx, agg) in worker_aggs.iter().enumerate() {
+        let func = match agg.func {
+            AggFunc::Sum | AggFunc::Count | AggFunc::CountDistinct => AggFunc::Sum,
+            AggFunc::Min => AggFunc::Min,
+            AggFunc::Max => AggFunc::Max,
+            AggFunc::Avg => {
+                return Err(anyhow::anyhow!(
+                    "worker aggregate list must not contain AVG after expansion"
+                ));
+            }
+        };
+        aggregates.push(AggExpr {
+            column: group_by_count + idx,
+            func,
+            output_name: agg.output_name.clone(),
+        });
+    }
+
+    Ok(HashAggConfig {
+        group_by: (0..group_by_count).collect(),
+        aggregates,
+    })
+}
+
+fn reconstruct_original_aggregate_batch(
+    merged_worker_batch: &RecordBatch,
+    group_by_count: usize,
+    original_aggs: &[AggExpr],
+    agg_mapping: &[Vec<usize>],
+) -> anyhow::Result<RecordBatch> {
+    let mut fields: Vec<Arc<Field>> = Vec::with_capacity(group_by_count + original_aggs.len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(group_by_count + original_aggs.len());
+
+    for idx in 0..group_by_count {
+        fields.push(Arc::new(merged_worker_batch.schema().field(idx).clone()));
+        columns.push(merged_worker_batch.column(idx).clone());
+    }
+
+    for (agg_idx, agg) in original_aggs.iter().enumerate() {
+        let source_idx = group_by_count + agg_mapping[agg_idx][0];
+        match agg.func {
+            AggFunc::Count | AggFunc::CountDistinct => {
+                let mut values = Vec::with_capacity(merged_worker_batch.num_rows());
+                for row in 0..merged_worker_batch.num_rows() {
+                    values.push(numeric_value_as_i64(merged_worker_batch.column(source_idx), row)?);
+                }
+                fields.push(Arc::new(Field::new(&agg.output_name, DataType::Int64, true)));
+                columns.push(Arc::new(Int64Array::from(values)));
+            }
+            AggFunc::Avg => {
+                let count_idx = group_by_count + agg_mapping[agg_idx][1];
+                let mut values = Vec::with_capacity(merged_worker_batch.num_rows());
+                for row in 0..merged_worker_batch.num_rows() {
+                    let sum = numeric_value_as_f64(merged_worker_batch.column(source_idx), row)?;
+                    let count = numeric_value_as_f64(merged_worker_batch.column(count_idx), row)?;
+                    values.push(if count > 0.0 { sum / count } else { 0.0 });
+                }
+                fields.push(Arc::new(Field::new(&agg.output_name, DataType::Float64, true)));
+                columns.push(Arc::new(Float64Array::from(values)));
+            }
+            AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
+                let mut values = Vec::with_capacity(merged_worker_batch.num_rows());
+                for row in 0..merged_worker_batch.num_rows() {
+                    values.push(numeric_value_as_f64(merged_worker_batch.column(source_idx), row)?);
+                }
+                fields.push(Arc::new(Field::new(&agg.output_name, DataType::Float64, true)));
+                columns.push(Arc::new(Float64Array::from(values)));
+            }
+        }
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+fn numeric_value_as_f64(array: &ArrayRef, row: usize) -> anyhow::Result<f64> {
+    if array.is_null(row) {
+        return Ok(0.0);
+    }
+    match array.data_type() {
+        DataType::Float64 => Ok(array.as_primitive::<arrow_array::types::Float64Type>().value(row)),
+        DataType::Int64 => Ok(array.as_primitive::<arrow_array::types::Int64Type>().value(row) as f64),
+        DataType::Int32 => Ok(array.as_primitive::<arrow_array::types::Int32Type>().value(row) as f64),
+        other => Err(anyhow::anyhow!(
+            "unsupported numeric type for distributed aggregate merge: {:?}",
+            other
+        )),
+    }
+}
+
+fn numeric_value_as_i64(array: &ArrayRef, row: usize) -> anyhow::Result<i64> {
+    if array.is_null(row) {
+        return Ok(0);
+    }
+    match array.data_type() {
+        DataType::Int64 => Ok(array.as_primitive::<arrow_array::types::Int64Type>().value(row)),
+        DataType::Int32 => Ok(array.as_primitive::<arrow_array::types::Int32Type>().value(row) as i64),
+        DataType::Float64 => Ok(array.as_primitive::<arrow_array::types::Float64Type>().value(row) as i64),
+        other => Err(anyhow::anyhow!(
+            "unsupported integer type for distributed aggregate merge: {:?}",
+            other
+        )),
+    }
+}
+
+async fn send_partial_batch(
+    endpoint: &str,
+    key: &str,
+    batch: RecordBatch,
+) -> anyhow::Result<()> {
+    let attempts = 3;
+    let batch_rows = batch.num_rows();
+    let batch_bytes: usize = batch
+        .columns()
+        .iter()
+        .map(|col| col.get_array_memory_size())
+        .sum();
+
+    for attempt in 1..=attempts {
+        let channel = Channel::from_shared(format!("http://{}", endpoint))?
+            .connect()
+            .await?;
+        let mut client = FlightServiceClient::new(channel);
+        let flight_data: Vec<_> = FlightDataEncoderBuilder::new()
+            .with_schema(batch.schema())
+            .with_flight_descriptor(Some(FlightDescriptor::new_cmd(key.as_bytes().to_vec())))
+            .build(stream::iter(vec![Ok(batch.clone())]))
+            .try_collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to encode partial aggregate batch: {}", e))?;
+
+        match client.do_put(stream::iter(flight_data)).await {
+            Ok(response) => {
+                let mut response = response.into_inner();
+                while response.message().await?.is_some() {}
+                return Ok(());
+            }
+            Err(err) if attempt < attempts => {
+                tracing::warn!(
+                    "partial aggregate send attempt {}/{} failed for key '{}' (rows={}, bytes={}): {}",
+                    attempt,
+                    attempts,
+                    key,
+                    batch_rows,
+                    batch_bytes,
+                    err,
+                );
+                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "partial aggregate send failed after {} attempts for key '{}' (rows={}, bytes={}): {}",
+                    attempts,
+                    key,
+                    batch_rows,
+                    batch_bytes,
+                    err
+                ));
+            }
+        }
+    }
+
+    unreachable!("send_partial_batch must return or error within retry loop")
+}
+
+async fn wait_for_partial_batches(
+    store: &PartitionStore,
+    keys: &[String],
+    timeout: Duration,
+) -> anyhow::Result<Vec<RecordBatch>> {
+    let deadline = Instant::now() + timeout;
+    let mut pending = keys.to_vec();
+    let mut batches = Vec::new();
+
+    while !pending.is_empty() {
+        let mut next_pending = Vec::new();
+        for key in pending {
+            let stored = store.get(&key).await;
+            if stored.is_empty() {
+                next_pending.push(key);
+                continue;
+            }
+            store.clear(&key).await;
+            batches.extend(stored);
+        }
+
+        if next_pending.is_empty() {
+            return Ok(batches);
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "timed out waiting for partial aggregate batches: {:?}",
+                next_pending
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        pending = next_pending;
+    }
+
+    Ok(batches)
 }
 
 impl QueryHandler {
@@ -734,10 +1170,16 @@ mod tests {
     use super::*;
     use arrow_array::{Float64Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use arrow_flight::flight_service_server::FlightServiceServer;
     use parquet::arrow::ArrowWriter;
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
     use serde_json::json;
+    use std::collections::HashMap as StdHashMap;
+    use std::sync::Arc;
+    use tonic::transport::Server;
+
+    use prism_flight::shuffle_writer::ShuffleFlightService;
 
     fn sample_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -783,15 +1225,10 @@ mod tests {
         assert_eq!(legacy.get("x").unwrap().num_rows(), 3);
     }
 
-    /// v2 protocol — `uris` populated, no `store_key`. Simulates the
-    /// delegation-driven path where the coordinator sends real file URIs.
-    /// We use a local `file://`-compatible temp directory so the URI goes
-    /// through the full `object_store` pathway just like S3 would.
     #[tokio::test]
     async fn test_protocol_v2_uri_list() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("t.parquet");
-        // Write a parquet file that the scan can read.
         let batch = sample_batch();
         let mut buf: Vec<u8> = Vec::new();
         let props = WriterProperties::builder()
@@ -804,28 +1241,24 @@ mod tests {
         }
         std::fs::write(&file_path, &buf).unwrap();
 
-        // Empty PartitionStore — scan must reach Parquet via URIs only.
         let store = PartitionStore::new();
         let command = json!({
             "tables": {
                 "x": {
                     "uris": [file_path.to_string_lossy()],
-                    // deliberately no store_key
+                    "store_key": null
                 }
             }
         });
 
         let hints: HashMap<String, ScanHint> = HashMap::new();
-        let (tables, _remaps) =
-            load_tables_smart(&command, &store, None, &hints).await.unwrap();
+        let (tables, _remaps) = load_tables_smart(&command, &store, None, &hints).await.unwrap();
 
         let batches = tables.get("x").unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 3);
     }
 
-    /// v2 protocol rejects bare-string tables values (the old protocol) with
-    /// a clear error. This enforces the "no backward-compat shim" rule.
     #[tokio::test]
     async fn test_protocol_v2_rejects_old_bare_string() {
         let store = PartitionStore::new();
@@ -841,6 +1274,145 @@ mod tests {
             err.contains("must be an object"),
             "expected v2 parse error, got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn reducer_merge_reconstructs_original_aggregates() {
+        let original_aggs = vec![
+            AggExpr {
+                column: 1,
+                func: AggFunc::Sum,
+                output_name: "agg_0".into(),
+            },
+            AggExpr {
+                column: 1,
+                func: AggFunc::Count,
+                output_name: "agg_1".into(),
+            },
+            AggExpr {
+                column: 1,
+                func: AggFunc::Avg,
+                output_name: "agg_2".into(),
+            },
+        ];
+        let (worker_aggs, agg_mapping) = expand_worker_aggregates(&original_aggs);
+        let merge_config = build_final_merge_config(1, &worker_aggs).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Utf8, false),
+            Field::new("agg_0", DataType::Float64, true),
+            Field::new("agg_1", DataType::Int64, true),
+            Field::new("agg_2", DataType::Float64, true),
+            Field::new("agg_3", DataType::Int64, true),
+        ]));
+
+        let partial_a = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["F", "O"])),
+                Arc::new(Float64Array::from(vec![100.0, 50.0])),
+                Arc::new(Int64Array::from(vec![2, 1])),
+                Arc::new(Float64Array::from(vec![100.0, 50.0])),
+                Arc::new(Int64Array::from(vec![2, 1])),
+            ],
+        )
+        .unwrap();
+        let partial_b = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["F", "P"])),
+                Arc::new(Float64Array::from(vec![30.0, 70.0])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Float64Array::from(vec![30.0, 70.0])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let merged = prism_executor::hash_aggregate::hash_aggregate_batches(
+            &[partial_a, partial_b],
+            &merge_config,
+        )
+        .unwrap();
+        let final_batch = reconstruct_original_aggregate_batch(
+            &merged,
+            1,
+            &original_aggs,
+            &agg_mapping,
+        )
+        .unwrap();
+
+        let statuses = final_batch.column(0).as_string::<i32>();
+        let sum = final_batch.column(1).as_primitive::<arrow_array::types::Float64Type>();
+        let count = final_batch.column(2).as_primitive::<arrow_array::types::Int64Type>();
+        let avg = final_batch.column(3).as_primitive::<arrow_array::types::Float64Type>();
+
+        let mut rows = StdHashMap::new();
+        for row in 0..final_batch.num_rows() {
+            rows.insert(
+                statuses.value(row).to_string(),
+                (sum.value(row), count.value(row), avg.value(row)),
+            );
+        }
+
+        assert_eq!(rows["F"], (130.0, 3, 130.0 / 3.0));
+        assert_eq!(rows["O"], (50.0, 1, 50.0));
+        assert_eq!(rows["P"], (70.0, 2, 35.0));
+    }
+
+    #[tokio::test]
+    async fn partial_batch_transport_round_trips_through_flight() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let store = Arc::new(PartitionStore::new());
+        let service = ShuffleFlightService::new(store.clone());
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(FlightServiceServer::new(service))
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("status", DataType::Utf8, false),
+                Field::new("agg_0", DataType::Float64, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["F"])),
+                Arc::new(Float64Array::from(vec![42.0])),
+            ],
+        )
+        .unwrap();
+
+        send_partial_batch(&addr.to_string(), "__partialagg/test/0", batch)
+            .await
+            .unwrap();
+        let received = wait_for_partial_batches(
+            &store,
+            &[String::from("__partialagg/test/0")],
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        server.abort();
+
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].num_rows(), 1);
+        assert_eq!(received[0].column(0).as_string::<i32>().value(0), "F");
+        assert_eq!(
+            received[0]
+                .column(1)
+                .as_primitive::<arrow_array::types::Float64Type>()
+                .value(0),
+            42.0
         );
     }
 }

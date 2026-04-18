@@ -63,6 +63,12 @@ pub struct HashJoinConfig {
     pub probe_keys: Vec<usize>,
 }
 
+/// Matched row indices for a single probe batch against the shared build side.
+pub struct ProbeMatches {
+    pub probe_indices: UInt32Array,
+    pub build_indices: UInt32Array,
+}
+
 /// A hash table built from the build side of a join.
 ///
 /// The table is partitioned into `HASH_PARTITIONS` sub-maps by the low bits
@@ -202,49 +208,65 @@ pub fn hash_join_probe_chunked(
     build_batch: &RecordBatch,
     config: &HashJoinConfig,
 ) -> Result<Vec<RecordBatch>> {
-    let hash_table = HashTable::build(build_batch, &config.build_keys)?;
+    let matches = probe_matches_chunked(
+        probe_batches,
+        build_batch,
+        &config.probe_keys,
+        &config.build_keys,
+    )?;
 
     let results: Vec<Result<RecordBatch>> = probe_batches
         .par_iter()
-        .map(|probe_batch| {
-            let (probe_idx, build_idx) = hash_table.probe(probe_batch, &config.probe_keys)?;
-            match config.join_type {
-                JoinType::Inner => {
-                    assemble_joined_batch(probe_batch, &probe_idx, build_batch, &build_idx)
-                }
-                JoinType::Left => {
-                    let (p_idx, b_idx) =
-                        left_join_indices(probe_batch.num_rows(), &probe_idx, &build_idx);
-                    assemble_joined_batch(probe_batch, &p_idx, build_batch, &b_idx)
-                }
-                JoinType::LeftSemi => {
-                    let matched = semi_join_mask(probe_batch.num_rows(), &probe_idx);
-                    let mask = arrow_array::BooleanArray::from(matched);
-                    let columns: Vec<_> = probe_batch
-                        .columns()
-                        .iter()
-                        .map(|c| compute::filter(c, &mask))
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    Ok(RecordBatch::try_new(probe_batch.schema(), columns)?)
-                }
-                JoinType::LeftAnti => {
-                    let matched: Vec<bool> = semi_join_mask(probe_batch.num_rows(), &probe_idx)
-                        .into_iter()
-                        .map(|m| !m)
-                        .collect();
-                    let mask = arrow_array::BooleanArray::from(matched);
-                    let columns: Vec<_> = probe_batch
-                        .columns()
-                        .iter()
-                        .map(|c| compute::filter(c, &mask))
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    Ok(RecordBatch::try_new(probe_batch.schema(), columns)?)
-                }
-                _ => {
-                    // Right/Full joins can't be trivially chunked (need global build-side tracking).
-                    // Fall back to single-batch for these types.
-                    assemble_joined_batch(probe_batch, &probe_idx, build_batch, &build_idx)
-                }
+        .zip(matches.into_par_iter())
+        .map(|(probe_batch, matched)| match config.join_type {
+            JoinType::Inner => {
+                assemble_joined_batch(
+                    probe_batch,
+                    &matched.probe_indices,
+                    build_batch,
+                    &matched.build_indices,
+                )
+            }
+            JoinType::Left => {
+                let (p_idx, b_idx) = left_join_indices(
+                    probe_batch.num_rows(),
+                    &matched.probe_indices,
+                    &matched.build_indices,
+                );
+                assemble_joined_batch(probe_batch, &p_idx, build_batch, &b_idx)
+            }
+            JoinType::LeftSemi => {
+                let matched = semi_join_mask(probe_batch.num_rows(), &matched.probe_indices);
+                let mask = arrow_array::BooleanArray::from(matched);
+                let columns: Vec<_> = probe_batch
+                    .columns()
+                    .iter()
+                    .map(|c| compute::filter(c, &mask))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(RecordBatch::try_new(probe_batch.schema(), columns)?)
+            }
+            JoinType::LeftAnti => {
+                let matched: Vec<bool> = semi_join_mask(probe_batch.num_rows(), &matched.probe_indices)
+                    .into_iter()
+                    .map(|m| !m)
+                    .collect();
+                let mask = arrow_array::BooleanArray::from(matched);
+                let columns: Vec<_> = probe_batch
+                    .columns()
+                    .iter()
+                    .map(|c| compute::filter(c, &mask))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(RecordBatch::try_new(probe_batch.schema(), columns)?)
+            }
+            _ => {
+                // Right/Full joins can't be trivially chunked (need global build-side tracking).
+                // Fall back to single-batch for these types.
+                assemble_joined_batch(
+                    probe_batch,
+                    &matched.probe_indices,
+                    build_batch,
+                    &matched.build_indices,
+                )
             }
         })
         .collect();
@@ -255,6 +277,33 @@ pub fn hash_join_probe_chunked(
         if batch.num_rows() > 0 {
             output.push(batch);
         }
+    }
+    Ok(output)
+}
+
+/// Probe a shared build-side hash table with many probe batches in parallel,
+/// returning only the matched row indices for each batch.
+pub fn probe_matches_chunked(
+    probe_batches: &[RecordBatch],
+    build_batch: &RecordBatch,
+    probe_key_cols: &[usize],
+    build_key_cols: &[usize],
+) -> Result<Vec<ProbeMatches>> {
+    let hash_table = HashTable::build(build_batch, build_key_cols)?;
+    let results: Vec<Result<ProbeMatches>> = probe_batches
+        .par_iter()
+        .map(|probe_batch| {
+            let (probe_indices, build_indices) = hash_table.probe(probe_batch, probe_key_cols)?;
+            Ok(ProbeMatches {
+                probe_indices,
+                build_indices,
+            })
+        })
+        .collect();
+
+    let mut output = Vec::with_capacity(results.len());
+    for result in results {
+        output.push(result?);
     }
     Ok(output)
 }

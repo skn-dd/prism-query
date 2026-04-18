@@ -50,7 +50,6 @@ pub fn consume_plan(substrait_bytes: &[u8]) -> Result<ExecutionPlan> {
     };
 
     let root_node = consume_rel(rel)?;
-    eprintln!("DBG_CONSUMED_PLAN: {:#?}", root_node);
 
     // Derive output schema from the plan node
     let output_schema = derive_schema(&root_node)?;
@@ -638,16 +637,19 @@ fn derive_schema(node: &PlanNode) -> Result<SchemaRef> {
             let mut fields: Vec<Field> = columns
                 .iter()
                 .map(|&i| {
-                    if i >= input_schema.fields().len() {
-                        eprintln!(
-                            "DBG_DERIVE Project: col idx {} >= input schema len {}. input_schema={:?}, columns={:?}",
-                            i, input_schema.fields().len(), input_schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>(), columns
-                        );
-                        eprintln!("DBG_DERIVE input node: {:#?}", input);
-                    }
-                    input_schema.field(i).clone()
+                    input_schema
+                        .fields()
+                        .get(i)
+                        .map(|field| field.as_ref().clone())
+                        .ok_or_else(|| {
+                            SubstraitError::Internal(format!(
+                                "project column index {} out of bounds for schema width {}",
+                                i,
+                                input_schema.fields().len()
+                            ))
+                        })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             for (i, _expr) in expressions.iter().enumerate() {
                 fields.push(Field::new(format!("expr_{}", i), DataType::Float64, true));
             }
@@ -662,16 +664,19 @@ fn derive_schema(node: &PlanNode) -> Result<SchemaRef> {
             let mut fields: Vec<Field> = group_by
                 .iter()
                 .map(|&i| {
-                    if i >= input_schema.fields().len() {
-                        eprintln!(
-                            "DBG_DERIVE Aggregate: gb idx {} >= input schema len {}. input_schema={:?}, group_by={:?}",
-                            i, input_schema.fields().len(), input_schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>(), group_by
-                        );
-                        eprintln!("DBG_DERIVE input node: {:#?}", input);
-                    }
-                    input_schema.field(i).clone()
+                    input_schema
+                        .fields()
+                        .get(i)
+                        .map(|field| field.as_ref().clone())
+                        .ok_or_else(|| {
+                            SubstraitError::Internal(format!(
+                                "aggregate group-by index {} out of bounds for schema width {}",
+                                i,
+                                input_schema.fields().len()
+                            ))
+                        })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             for agg in aggregates {
                 let dt = match agg.func {
                     AggFunc::Count | AggFunc::CountDistinct => DataType::Int64,

@@ -141,13 +141,13 @@ The companion `architecture.md` describes the target design. The following piece
 
 - **Java↔Rust JNI bridge in the production path.** The JNI entry exists (`prism-jni`) but production uses Arrow Flight (out-of-process), not JNI (in-process).
 - **Mixed native/JVM execution with automatic fallback.** `SubstraitSerializer.isNativeSupported()` exists but is only consulted inside the `prism` catalog's own pushdown logic, not as a global operator-by-operator router.
-- **Arrow Flight shuffle replacing Trino's `ExchangeOperator`.** The Flight server exists per-worker for result delivery, but inter-worker shuffle still uses Trino's native exchange.
+- **Arrow Flight shuffle replacing Trino's `ExchangeOperator`.** The Flight server now handles result delivery and reducer-style inter-worker partial-aggregate transfer, but general hash-shuffle/exchange still uses Trino's native exchange.
 - **OSI semantic layer at query time.** `osi-models/` and `prism-osi/` exist; there is no `osi.*` catalog resolver in the coordinator path.
 - **Ranger policy enforcement.** Relies on Trino 480+ built-in support; not actively configured in the benchmark environment.
 
 ## 8. Known Structural Limits
 
-- `Trino PushAggregationIntoTableScan` rule only matches `step=SINGLE` aggregates, which blocks aggregation pushdown for join queries (see memory: "Join query bottleneck at SF100"). This is why the 8-query bench excludes the join query.
+- `Trino PushAggregationIntoTableScan` rule still only matches `step=SINGLE` aggregates, but Prism now bypasses that limitation for the join-aggregation benchmark by looking through rename-only projections in the connector and executing the final merge on Prism workers instead of the Trino coordinator.
 - Schema evolution for pushdown tables is manual — new tables require editing `TPCH_TABLES` and redeploying the plugin jar.
 - Worker failure handling is minimal; a worker crash during `DoAction("execute")` fails the query.
 

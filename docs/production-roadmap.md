@@ -20,7 +20,7 @@ Prism is a hybrid Java/Rust query engine built as a Trino connector plugin. It o
 | Date32 type end-to-end (filter, compare, Substrait, datagen) | Done |
 | LIKE/ILIKE predicate via SIMD string kernels | Done |
 | Parquet reader with row group statistics skipping | Done |
-| Arrow Flight shuffle (zero-copy gRPC transport) | Done |
+| Arrow Flight result transport + reducer partial-agg transport (full mesh still pending) | Done |
 | Substrait plan exchange (Java serialize, Rust consume) | Done |
 | JNI bridge (Java -> Rust) for embedded execution | Done |
 

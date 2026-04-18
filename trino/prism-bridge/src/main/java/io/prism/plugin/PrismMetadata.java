@@ -404,9 +404,10 @@ public class PrismMetadata implements ConnectorMetadata {
         }
 
         if (!hasComputedExprs) {
-            // Column-only projection: create a column-pruning Project if it reduces columns.
-            // This absorbs Trino's ProjectNode so PushAggregationIntoTableScan can fire.
-            // Convergence: only accept if selectCols.size() < currentOutputCols.
+            // Column-only projection: create a Project when it either prunes columns
+            // or absorbs a rename-only projection over an existing pushed plan.
+            // The latter is what lets join pushdown converge into a connector-level
+            // plan that aggregate pushdown can target.
             if (handle.getPushedPlan().isPresent()) {
                 List<Integer> selectCols = new ArrayList<>();
                 Map<Integer, Integer> remap = new HashMap<>();
@@ -422,9 +423,12 @@ public class PrismMetadata implements ConnectorMetadata {
                     }
                 }
                 int currentOutputCols = computePlanColumnCount(currentPlan, handle.getTableName());
+                boolean alreadyMaterialized = isColumnOnlyProject(currentPlan, selectCols);
                 LOG.info("applyProjection: column-only pruning check: selectCols=" + selectCols.size() +
-                         " vs currentOutputCols=" + currentOutputCols + ", selectCols=" + selectCols);
-                if (selectCols.size() < currentOutputCols) {
+                         " vs currentOutputCols=" + currentOutputCols + ", selectCols=" + selectCols +
+                         ", alreadyMaterialized=" + alreadyMaterialized);
+                if (selectCols.size() < currentOutputCols ||
+                        (selectCols.size() == currentOutputCols && !alreadyMaterialized)) {
                     PrismPlanNode projectPlan = new PrismPlanNode.Project(currentPlan, selectCols);
                     PrismTableHandle newHandle = handle.withPushedPlan(projectPlan);
                     // Remap output assignments to new 0-based positions.
@@ -468,8 +472,7 @@ public class PrismMetadata implements ConnectorMetadata {
                             new ArrayList<>(remapped.values()),
                             false));
                 }
-                // selectCols >= currentOutputCols — no pruning possible, converge
-                LOG.info("applyProjection: no pruning possible, returning empty to converge");
+                LOG.info("applyProjection: no column-only projection change, returning empty to converge");
             }
             return Optional.empty();
         }
@@ -1030,6 +1033,14 @@ public class PrismMetadata implements ConnectorMetadata {
         if (node instanceof PrismPlanNode.Aggregate a) return findScanTableName(a.input());
         if (node instanceof PrismPlanNode.Sort s) return findScanTableName(s.input());
         return null;
+    }
+
+    private boolean isColumnOnlyProject(PrismPlanNode plan, List<Integer> selectCols) {
+        if (plan instanceof PrismPlanNode.Project project) {
+            return (project.expressions() == null || project.expressions().isEmpty()) &&
+                    project.columnIndices().equals(selectCols);
+        }
+        return false;
     }
 
     PrismPlanNode buildFullScan(String tableName) {

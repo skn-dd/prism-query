@@ -116,7 +116,9 @@ public class PrismPageSource implements ConnectorPageSource {
                 // prefer_single_worker session override: force the single-worker path
                 // even when multi-worker fan-out would normally fire. Used for testing
                 // and debugging per-worker correctness.
-                if (!preferSingleWorker && workerCount > 1 && hasAggregation()) {
+                if (workerCount > 1 && hasAggregation() && hasJoin()) {
+                    executeOnReducerWorker();
+                } else if (!preferSingleWorker && workerCount > 1 && hasAggregation()) {
                     executeOnAllWorkers();
                 } else if (!preferSingleWorker && workerCount > 1 && hasSortWithLimit()) {
                     executeOnAllWorkersSort();
@@ -297,6 +299,60 @@ public class PrismPageSource implements ConnectorPageSource {
             return proj.columnIndices();
         }
         return null;
+    }
+
+    /**
+     * Fan-out: each worker computes a local partial aggregation, non-reducers push
+     * their partial result to the elected reducer, and the reducer returns the final
+     * merged aggregate back to Trino.
+     */
+    private void executeOnReducerWorker() throws Exception {
+        PrismPlanNode plan = tableHandle.getPushedPlan().orElseThrow();
+        byte[] substraitBytes = SubstraitSerializer.serialize(plan);
+        String planB64 = Base64.getEncoder().encodeToString(substraitBytes);
+
+        int workerCount = executor.workerCount();
+        String queryId = UUID.randomUUID().toString();
+        int reducerIndex = Math.floorMod(queryId.hashCode(), workerCount);
+        String[] resultKeys = new String[workerCount];
+
+        ObjectNode tablesTemplate = MAPPER.createObjectNode();
+        tablesTemplate.put(tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
+        addJoinTables(plan, tablesTemplate);
+
+        CompletableFuture<?>[] futures = new CompletableFuture[workerCount];
+        for (int i = 0; i < workerCount; i++) {
+            final int wi = i;
+            resultKeys[i] = "result/" + UUID.randomUUID();
+
+            ObjectNode command = MAPPER.createObjectNode();
+            command.put("substrait_plan_b64", planB64);
+            command.put("result_key", resultKeys[i]);
+            command.set("tables", tablesTemplate.deepCopy());
+
+            ObjectNode dist = command.putObject("distributed_aggregate");
+            dist.put("query_id", queryId);
+            dist.put("role", wi == reducerIndex ? "reducer" : "producer");
+            dist.put("worker_index", wi);
+            dist.put("reducer_index", reducerIndex);
+            dist.put("reducer_endpoint", executor.workerAddress(reducerIndex));
+            dist.put("expected_workers", workerCount);
+            dist.put("timeout_ms", 30_000);
+
+            String cmdJson = MAPPER.writeValueAsString(command);
+            futures[i] = CompletableFuture.runAsync(() -> {
+                try {
+                    executor.executeQuery(wi, cmdJson);
+                } catch (Exception e) {
+                    throw new RuntimeException("Worker " + wi + " failed: " + e.getMessage(), e);
+                }
+            });
+        }
+
+        CompletableFuture.allOf(futures).join();
+
+        flightStream = executor.fetchResultStream(reducerIndex, resultKeys[reducerIndex]);
+        root = flightStream.getRoot();
     }
 
     /**
