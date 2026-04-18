@@ -143,6 +143,9 @@ public class PrismMetadata implements ConnectorMetadata {
             ConnectorSession session,
             ConnectorTableHandle table,
             Constraint constraint) {
+        if (!PrismSessionProperties.isAccelerationEnabled(session)) {
+            return Optional.empty();
+        }
         PrismTableHandle handle = (PrismTableHandle) table;
 
         TupleDomain<ColumnHandle> summary = constraint.getSummary();
@@ -352,6 +355,9 @@ public class PrismMetadata implements ConnectorMetadata {
             ConnectorTableHandle table,
             List<ConnectorExpression> projections,
             Map<String, ColumnHandle> assignments) {
+        if (!PrismSessionProperties.isAccelerationEnabled(session)) {
+            return Optional.empty();
+        }
         PrismTableHandle handle = (PrismTableHandle) table;
         LOG.info("applyProjection called: table=" + handle.getTableName() +
                  ", projections=" + projections.size() +
@@ -525,6 +531,9 @@ public class PrismMetadata implements ConnectorMetadata {
             List<AggregateFunction> aggregates,
             Map<String, ColumnHandle> assignments,
             List<List<ColumnHandle>> groupingSets) {
+        if (!PrismSessionProperties.isAccelerationEnabled(session)) {
+            return Optional.empty();
+        }
         PrismTableHandle handle = (PrismTableHandle) table;
         LOG.info("applyAggregation called: table=" + handle.getTableName() +
                  ", aggregates=" + aggregates.size() +
@@ -681,6 +690,9 @@ public class PrismMetadata implements ConnectorMetadata {
             long topNCount,
             List<SortItem> sortItems,
             Map<String, ColumnHandle> assignments) {
+        if (!PrismSessionProperties.isAccelerationEnabled(session)) {
+            return Optional.empty();
+        }
         PrismTableHandle handle = (PrismTableHandle) table;
 
         LOG.info("applyTopN called: topNCount=" + topNCount +
@@ -753,6 +765,9 @@ public class PrismMetadata implements ConnectorMetadata {
             Map<String, ColumnHandle> leftAssignments,
             Map<String, ColumnHandle> rightAssignments,
             JoinStatistics statistics) {
+        if (!PrismSessionProperties.isAccelerationEnabled(session)) {
+            return Optional.empty();
+        }
         PrismTableHandle leftHandle = (PrismTableHandle) left;
         PrismTableHandle rightHandle = (PrismTableHandle) right;
 
@@ -890,6 +905,9 @@ public class PrismMetadata implements ConnectorMetadata {
             ConnectorSession session,
             ConnectorTableHandle table,
             long limit) {
+        if (!PrismSessionProperties.isAccelerationEnabled(session)) {
+            return Optional.empty();
+        }
         PrismTableHandle handle = (PrismTableHandle) table;
 
         if (limit <= 0 || limit > Integer.MAX_VALUE) {
