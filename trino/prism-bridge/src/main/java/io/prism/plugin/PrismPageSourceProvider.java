@@ -1,6 +1,8 @@
 package io.prism.plugin;
 
 import io.prism.bridge.PrismFlightExecutor;
+import io.prism.plugin.events.PrismQueryStats;
+import io.prism.plugin.events.PrismQueryStatsRegistry;
 import io.trino.spi.connector.*;
 
 import java.util.List;
@@ -27,6 +29,9 @@ public class PrismPageSourceProvider implements ConnectorPageSourceProvider {
                 .map(c -> (PrismColumnHandle) c)
                 .toList();
 
-        return new PrismPageSource(executor, prismSplit, prismTable, prismColumns, session);
+        PrismQueryStats stats = PrismQueryStatsRegistry.getInstance()
+                .getOrCreate(session.getQueryId());
+
+        return new PrismPageSource(executor, prismSplit, prismTable, prismColumns, session, stats);
     }
 }

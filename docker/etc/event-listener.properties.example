@@ -1,0 +1,21 @@
+# Prism event listener — copy to event-listener.properties to enable.
+#
+# This registers the `prism-events` EventListenerFactory provided by the
+# Prism plugin. Once enabled, Trino emits a structured JSON line per query
+# on the SLF4J logger `io.prism.events` (log level INFO). Operators can
+# route that logger to any existing sink (file, Fluent Bit, Vector, Kafka)
+# via their Log4j2/Logback config — no Prism-specific audit pipe required.
+#
+# Prism fields emitted (as JSON keys on the log line):
+#   prism.acceleration_used       — did the query hit a Rust worker (bool)
+#   prism.bytes_scanned           — bytes read from object store
+#   prism.rows_produced           — rows returned by workers
+#   prism.worker_ids              — comma-separated worker ids
+#   prism.rust_runtime_ms         — ms spent in Rust execution
+#   prism.substrait_plan_bytes    — size of shipped Substrait plan
+#   prism.connector_fallback_reason — set when pushdown was rejected
+#
+# Multiple event listeners can coexist: this one does not replace your
+# cluster's existing Kafka/audit EventListener, it runs alongside it.
+
+event-listener.name=prism-events
