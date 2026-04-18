@@ -7,16 +7,25 @@ import io.trino.spi.connector.ConnectorPageSourceProvider;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorSplitManager;
 import io.trino.spi.connector.ConnectorTransactionHandle;
+import io.trino.spi.session.PropertyMetadata;
 import io.trino.spi.transaction.IsolationLevel;
+
+import java.util.List;
 
 public class PrismConnector implements Connector {
     private final PrismFlightExecutor executor;
     private final PrismMetadata metadata;
     private final PrismSplitManager splitManager;
     private final PrismPageSourceProvider pageSourceProvider;
+    private final PrismSessionProperties sessionProperties;
 
     public PrismConnector(PrismFlightExecutor executor) {
+        this(executor, new PrismSessionProperties());
+    }
+
+    public PrismConnector(PrismFlightExecutor executor, PrismSessionProperties sessionProperties) {
         this.executor = executor;
+        this.sessionProperties = sessionProperties;
         this.metadata = new PrismMetadata();
         this.splitManager = new PrismSplitManager(executor);
         this.pageSourceProvider = new PrismPageSourceProvider(executor);
@@ -40,6 +49,11 @@ public class PrismConnector implements Connector {
     @Override
     public ConnectorPageSourceProvider getPageSourceProvider() {
         return pageSourceProvider;
+    }
+
+    @Override
+    public List<PropertyMetadata<?>> getSessionProperties() {
+        return sessionProperties.getSessionProperties();
     }
 
     @Override

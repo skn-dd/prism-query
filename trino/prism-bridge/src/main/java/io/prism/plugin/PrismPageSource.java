@@ -7,6 +7,7 @@ import io.prism.bridge.SubstraitSerializer;
 import io.trino.spi.Page;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.connector.ConnectorPageSource;
+import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.type.*;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.vector.*;
@@ -28,6 +29,8 @@ public class PrismPageSource implements ConnectorPageSource {
     private final PrismSplit split;
     private final PrismTableHandle tableHandle;
     private final List<PrismColumnHandle> columns;
+    private final int memoryBudgetGb;
+    private final boolean preferSingleWorker;
 
     private boolean finished;
     private boolean executed;
@@ -47,10 +50,33 @@ public class PrismPageSource implements ConnectorPageSource {
             PrismSplit split,
             PrismTableHandle tableHandle,
             List<PrismColumnHandle> columns) {
+        this(executor, split, tableHandle, columns, 0, false);
+    }
+
+    public PrismPageSource(
+            PrismFlightExecutor executor,
+            PrismSplit split,
+            PrismTableHandle tableHandle,
+            List<PrismColumnHandle> columns,
+            ConnectorSession session) {
+        this(executor, split, tableHandle, columns,
+                PrismSessionProperties.getMemoryBudgetGb(session),
+                PrismSessionProperties.isPreferSingleWorker(session));
+    }
+
+    PrismPageSource(
+            PrismFlightExecutor executor,
+            PrismSplit split,
+            PrismTableHandle tableHandle,
+            List<PrismColumnHandle> columns,
+            int memoryBudgetGb,
+            boolean preferSingleWorker) {
         this.executor = executor;
         this.split = split;
         this.tableHandle = tableHandle;
         this.columns = columns;
+        this.memoryBudgetGb = memoryBudgetGb;
+        this.preferSingleWorker = preferSingleWorker;
     }
 
     @Override
@@ -75,11 +101,14 @@ public class PrismPageSource implements ConnectorPageSource {
         try {
             if (!executed) {
                 int workerCount = executor.workerCount();
-                if (workerCount > 1 && hasAggregation()) {
+                // prefer_single_worker session override: force the single-worker path
+                // even when multi-worker fan-out would normally fire. Used for testing
+                // and debugging per-worker correctness.
+                if (!preferSingleWorker && workerCount > 1 && hasAggregation()) {
                     executeOnAllWorkers();
-                } else if (workerCount > 1 && hasSortWithLimit()) {
+                } else if (!preferSingleWorker && workerCount > 1 && hasSortWithLimit()) {
                     executeOnAllWorkersSort();
-                } else if (workerCount > 1 && hasJoin()) {
+                } else if (!preferSingleWorker && workerCount > 1 && hasJoin()) {
                     executeOnAllWorkersConcat();
                 } else {
                     executeOnWorker();
@@ -190,6 +219,7 @@ public class PrismPageSource implements ConnectorPageSource {
             command.put("substrait_plan_b64", planB64);
             command.put("result_key", resultKeys[i]);
             command.set("tables", tablesTemplate.deepCopy());
+            addSessionFields(command);
             String cmdJson = MAPPER.writeValueAsString(command);
             futures[i] = CompletableFuture.runAsync(() -> {
                 try {
@@ -286,6 +316,7 @@ public class PrismPageSource implements ConnectorPageSource {
             command.put("substrait_plan_b64", planB64);
             command.put("result_key", resultKeys[i]);
             command.set("tables", tablesTemplate.deepCopy());
+            addSessionFields(command);
             String cmdJson = MAPPER.writeValueAsString(command);
             futures[i] = CompletableFuture.runAsync(() -> {
                 try {
@@ -383,6 +414,7 @@ public class PrismPageSource implements ConnectorPageSource {
             command.put("substrait_plan_b64", planB64);
             command.put("result_key", resultKeys[i]);
             command.set("tables", tablesTemplate.deepCopy());
+            addSessionFields(command);
             String cmdJson = MAPPER.writeValueAsString(command);
             futures[i] = CompletableFuture.runAsync(() -> {
                 try {
@@ -648,6 +680,7 @@ public class PrismPageSource implements ConnectorPageSource {
         ObjectNode tablesNode = command.putObject("tables");
         tablesNode.put(tableHandle.getTableName(), "tpch/" + tableHandle.getTableName());
         addJoinTables(plan, tablesNode);
+        addSessionFields(command);
 
         executor.executeQuery(split.getWorkerIndex(), MAPPER.writeValueAsString(command));
 
@@ -663,6 +696,18 @@ public class PrismPageSource implements ConnectorPageSource {
             } catch (Exception e) {
                 throw new IOException("Failed to close FlightStream", e);
             }
+        }
+    }
+
+    /**
+     * Attach per-session tunables to the worker command. Only emit memory_budget_gb
+     * when a non-zero value is set so the worker's own default still applies when
+     * the operator hasn't configured one. The Rust worker is free to ignore
+     * unknown fields; the honoring side lands in a separate slice.
+     */
+    private void addSessionFields(ObjectNode command) {
+        if (memoryBudgetGb > 0) {
+            command.put("memory_budget_gb", memoryBudgetGb);
         }
     }
 

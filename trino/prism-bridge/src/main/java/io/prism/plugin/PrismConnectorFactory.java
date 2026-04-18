@@ -24,6 +24,11 @@ public class PrismConnectorFactory implements ConnectorFactory {
                 .collect(Collectors.toList());
 
         PrismFlightExecutor executor = new PrismFlightExecutor(workers);
-        return new PrismConnector(executor);
+        // Seed session-property defaults from catalog config. This is the SPI-supported
+        // mechanism: Trino exposes catalog properties as a raw Map here, and we fold
+        // their values into the default arguments of each PropertyMetadata. Users can
+        // still override per-session with `SET SESSION prism.<name>=...`.
+        PrismSessionProperties sessionProperties = PrismSessionProperties.fromCatalogConfig(config);
+        return new PrismConnector(executor, sessionProperties);
     }
 }

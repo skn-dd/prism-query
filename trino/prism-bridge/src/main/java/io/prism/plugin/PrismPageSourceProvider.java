@@ -27,6 +27,6 @@ public class PrismPageSourceProvider implements ConnectorPageSourceProvider {
                 .map(c -> (PrismColumnHandle) c)
                 .toList();
 
-        return new PrismPageSource(executor, prismSplit, prismTable, prismColumns);
+        return new PrismPageSource(executor, prismSplit, prismTable, prismColumns, session);
     }
 }
