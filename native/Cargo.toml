@@ -29,8 +29,14 @@ arrow-schema = "55"
 arrow-select = "55"
 arrow-string = "55"
 
-# Parquet columnar storage
-parquet = { version = "55", default-features = false, features = ["arrow", "snap"] }
+# Parquet columnar storage. `object_store` enables async + ParquetObjectReader.
+parquet = { version = "55", default-features = false, features = ["arrow", "snap", "object_store"] }
+
+# Object storage abstraction (S3, GCS, Azure ADLS, local file system)
+# Version pinned to 0.12 for compatibility with parquet 55's internal dependency.
+object_store = { version = "0.12", features = ["aws", "gcp", "azure"] }
+url = "2"
+bytes = "1"
 
 # DataFusion (for expression evaluation and utilities)
 datafusion = "46"
