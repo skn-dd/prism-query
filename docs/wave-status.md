@@ -81,3 +81,33 @@ Four independent pieces that can land concurrently, each touching a disjoint pat
 **Author track (not an agent job):** open the upstream Trino SPI PR extending `MetadataProvider` (item 1). 2–4 week cycle.
 
 **Second pass after the slice above:** Decimal128 (item 4), remove shuffle parallel-universe (item 9), factor `prism-flight-client` (item 10) once both plugins have stabilized.
+
+## Still missing after the slice — not tracked in Phases 2–9
+
+Items that remain after the full wave-status slice (agents A–D + second pass + author-track SPI PR) lands. These live outside the Phase 2–9 production-readiness scope in `production-plan.md` and need explicit follow-up here.
+
+### Gated on metadata delegation (item 1)
+
+These cascade from the Trino SPI gap. No code can ship until the upstream `MetadataProvider.getTableHandle` / `getSplitSource` PR lands.
+
+- **Hive Metastore (HMS) as a delegated catalog source.** The named-catalog delegation pattern (`prism.delegate-catalog-name=hive`) is meant to cover HMS, Glue, and Iceberg REST uniformly via item 1's SPI PR. Phase 1.3 describes the pattern; the SPI gap means it produces no running code today. Without the PR, `TPCH_TABLES` remains the only table resolution path for all three metadata source types.
+- **Ranger row-filter and column-mask cascade.** Trino's `SystemAccessControl` attaches row filters and column masks to `ConnectorMetadata.applyRowFilters` / `applyColumnMasks`. Prism's current `TPCH_TABLES`-backed metadata does not implement these hooks, so Ranger policies that work on `hive.*` / `iceberg.*` catalogs silently do not apply to `prism.*` queries. Phase 7 covers Ranger *hardening only* (secret provisioning, removing the hardcoded admin password) — not this cascade. The fix is a small plugin change to forward the policy decisions through the delegated metadata once delegation exists; until then, any claim that Ranger "works with Prism" is only true for coarse-grained table/schema-level policies evaluated at plan time, not for row or column-level masking.
+- **Column-ID threading for schema evolution.** Iceberg/Delta `fieldId` values live in the delegated catalog's metadata; without delegation there's no source of IDs, so schema evolution through projected scans cannot round-trip correctly.
+
+### SQL feature coverage (not in Phases 2–9)
+
+Phases 2–9 cover operational readiness (enablement, containers, Helm, discovery, observability, security, reliability, CI/CD) — they do **not** cover language surface. These feature gaps show up in real workloads and block adoption on their own:
+
+- **Window functions** — `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `SUM/AVG/MIN/MAX OVER`. Heavy analytics use. Needs `PlanNode::Window` + Substrait `ConsistentPartitionWindowRel` consumer + frame evaluation.
+- **Set operations** — `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` via Substrait `SetRel`.
+- **Cross join + non-equi / theta join** — nested-loop fallback when `extract_join_keys()` finds no equi-join condition.
+- **Complex types** — `Timestamp(µs)`, `Interval`, `List`, `Struct`, `Map` threaded through filter/projection/aggregation. Today most of these fall back to error at the Substrait consumer.
+
+### Explicitly deferred post-v1 (noted for completeness)
+
+Called out in `production-plan.md` as deliberate non-goals; listed here so the gap list is exhaustive:
+
+- Write path (`INSERT` / `MERGE` / `DELETE`).
+- Hudi support.
+- JDBC federation (roadmap Path B — reopen only with profiled evidence of JVM operator bottleneck).
+- Full engine replacement (roadmap Path C).
