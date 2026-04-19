@@ -91,7 +91,7 @@ Items that remain after the full wave-status slice (agents A–D + second pass +
 These cascade from the Trino SPI gap. No code can ship until the upstream `MetadataProvider.getTableHandle` / `getSplitSource` PR lands.
 
 - **Hive Metastore (HMS) as a delegated catalog source.** The named-catalog delegation pattern (`prism.delegate-catalog-name=hive`) is meant to cover HMS, Glue, and Iceberg REST uniformly via item 1's SPI PR. Phase 1.3 describes the pattern; the SPI gap means it produces no running code today. Without the PR, `TPCH_TABLES` remains the only table resolution path for all three metadata source types.
-- **Ranger row-filter and column-mask cascade.** Trino's `SystemAccessControl` attaches row filters and column masks to `ConnectorMetadata.applyRowFilters` / `applyColumnMasks`. Prism's current `TPCH_TABLES`-backed metadata does not implement these hooks, so Ranger policies that work on `hive.*` / `iceberg.*` catalogs silently do not apply to `prism.*` queries. Phase 7 covers Ranger *hardening only* (secret provisioning, removing the hardcoded admin password) — not this cascade. The fix is a small plugin change to forward the policy decisions through the delegated metadata once delegation exists; until then, any claim that Ranger "works with Prism" is only true for coarse-grained table/schema-level policies evaluated at plan time, not for row or column-level masking.
+- **Ranger row-filter and column-mask cascade through `ConnectorMetadata` hooks** — only one part of a larger Ranger gap. See [Ranger row/column security — implementation plan](#ranger-rowcolumn-security--implementation-plan) below for the full breakdown; only gap 6 of that plan is gated on item 1.
 - **Column-ID threading for schema evolution.** Iceberg/Delta `fieldId` values live in the delegated catalog's metadata; without delegation there's no source of IDs, so schema evolution through projected scans cannot round-trip correctly.
 
 ### SQL feature coverage (not in Phases 2–9)
@@ -111,3 +111,86 @@ Called out in `production-plan.md` as deliberate non-goals; listed here so the g
 - Hudi support.
 - JDBC federation (roadmap Path B — reopen only with profiled evidence of JVM operator bottleneck).
 - Full engine replacement (roadmap Path C).
+
+## Ranger row/column security — implementation plan
+
+### Current state (2026-04-19)
+
+Trino's `SystemAccessControl` SPI is already wired cluster-wide via `docker/etc/ranger-access-control.properties` (`access-control.name=ranger`, `ranger.service-name=prism`). Coarse table/schema grants are enforced by the coordinator before the plan reaches `PrismMetadata`, so **table/schema-level authorization works today**. Row filters and column masks, however, have three independent gaps that all silently compromise them:
+
+| Symptom today | Root cause |
+|---|---|
+| Policies using `current_user()` / `is_member_of_group()` produce wrong results | `ConnectorSession.getIdentity()` is not plumbed into the Rust worker — grep confirms zero `getIdentity` / `ExtraCredentials` references in `trino/prism-bridge/src/main/`. |
+| Every non-trivial column mask errors or mis-evaluates | `native/prism-substrait/src/consumer.rs` has zero coverage for `IfThen` / `CASE` expressions — verified by grep. Every practical column mask is `CASE WHEN has_access() THEN col ELSE mask(col) END`. |
+| Policy audit invisible downstream | `f54e6e0` EventListener does not emit which policies applied, which columns were masked, or whether a row filter was active. |
+
+The common framing that "Prism inherits Ranger for free via Trino's SPI" is true only for table/schema-level grants. Row and column security require explicit implementation work.
+
+### Gaps and fixes
+
+**Gap 1 — Session identity propagation** (unblocked, foundational)
+- Thread `session.getIdentity()` (user, groups, roles, `ExtraCredentials`) through `PrismFlightExecutor.executeQuery()` into the `DoAction` payload. Extend the protocol-v2 envelope (landed in `74b7f2d`) with a `session_context { user, groups[], roles[] }` field.
+- Rust worker decodes `session_context` into a per-query evaluation context accessible by the expression engine.
+- mTLS is already in place (`ecc2151`) — hard requirement since identity now travels on the wire.
+
+**Gap 2 — Built-in ACL scalar functions in Rust** (unblocked; depends on gap 1)
+- `current_user()`, `current_role()`, `current_catalog()`, `current_schema()`, `is_member_of(group)`, `current_groups()`.
+- Sourced from the session context populated by gap 1. No side-channel to a Ranger server — the engine's already-resolved identity is the only input.
+- Substrait consumer maps Trino's security function URIs to the Rust implementations.
+
+**Gap 3 — `IfThen` / `CASE` in Substrait consumer** (unblocked; zero coverage today)
+- Add `Expression::IfThen` consumer path in `native/prism-substrait/src/consumer.rs`.
+- Evaluation via arrow-rs `case_when` kernel.
+- Test coverage: three-way CASE with literal branches, CASE on identity-function output, nested CASE, CASE referring to other columns. Without this, column masking is fundamentally unimplementable — grep confirmed.
+
+**Gap 4 — String-masking kernels** (unblocked)
+- Audit current coverage in `native/prism-executor/src/filter_project.rs`.
+- Fill in what Ranger policies typically use: `substring` / `substr`, `replace`, `regexp_replace`, `concat`, `length`, `lower`, `upper`, `lpad` / `rpad`.
+- Policies commonly mask as `concat('***-**-', substring(ssn, -4))`, `regexp_replace(email, '(?<=.).(?=[^@]*@)', '*')`, or fully-literal replacement — the full set needs to route through arrow-rs string kernels.
+
+**Gap 5 — UDF fallback strategy** (unblocked)
+Ranger policies often embed custom Java UDFs via Trino function plugins. These cannot run in Rust. Three behaviors need explicit definition:
+- **Static UDF (plan-time evaluable):** coordinator pre-evaluates, materializes the result as a Substrait literal before sending to Prism.
+- **Per-row UDF:** coordinator inspects the `ViewExpression` function URIs at plan time. If any URI is not in Prism's supported set, either (a) fail with `TrinoException(NOT_SUPPORTED, "Ranger policy <id> uses UDF <x> not available in accelerated path")`, or (b) transparently route the query through standard Trino execution via an internal `prism.acceleration_enabled=false` override. Pick one; document it.
+- **Registry:** maintain `PrismSupportedFunctions` — the union of built-in scalars, ACL functions (gap 2), string kernels (gap 4), and the generic numeric/date vocabulary already consumed. Consulted by the plan-time routing decision.
+
+**Gap 6 — `ConnectorMetadata.getRowFilters` / `getColumnMasks` hooks** (gated on item 1)
+Connector-level hooks matter for two reasons:
+- **Pushdown optimization:** row filter into Parquet row-group stats, Iceberg partition pruning, predicate elision.
+- **Delegated-catalog cascade:** when `prism.delegate-catalog-name=iceberg` is configured (item 1), Ranger policies attached to the iceberg catalog must flow through Prism's metadata to the Substrait plan.
+- Forward to the delegated catalog's implementation once delegation exists. For the current `TPCH_TABLES` path: return empty lists — correctness is already handled by the engine-level plan rewrite; there is no pushdown benefit for synthetic TPCH data.
+
+**Gap 7 — EventListener policy audit fields** (unblocked)
+Extend the `f54e6e0` EventListener payload:
+- `ranger_policies_applied: List<String>` — policy IDs evaluated.
+- `ranger_masked_columns: List<CatalogSchemaTableColumnName>` — columns that had a mask applied.
+- `ranger_row_filter_applied: bool` — whether any row filter attached.
+- Source: inspect the rewritten plan reaching `PrismMetadata.getTableHandle()` — by that point the coordinator has already resolved and attached the policies.
+
+**Gap 8 — Integration test surface** (unblocked; depends on gaps 1–5 and 7)
+Policy fixtures in `docker/etc/ranger/` (directory exists but is empty today):
+- One row-filter policy (`region = current_user_region()`).
+- One column-mask policy using `CASE WHEN ... THEN col ELSE mask(col) END`.
+- One policy using a supported ACL function.
+- One policy using an unsupported UDF to exercise the gap-5 fallback.
+
+Test matrix: full-access user (baseline), restricted user (row filter reduces count, column mask applied), unsupported-UDF query (expected `NOT_SUPPORTED` or fallback), EventListener emits all audit fields. Runs against `apache/ranger:2.4.0` already in `docker/docker-compose.yml:49`.
+
+**Gap 9 — Operator documentation** (unblocked)
+Runbook covering: supported policy idioms with examples, unsupported UDFs + fallback behavior, user-facing error messages, per-query opt-out via `SET SESSION prism.acceleration_enabled=false`.
+
+### Implementation order and agent slicing
+
+| Order | Agent | Gap | Size | Depends on |
+|---|---|---|---|---|
+| 1 | E | Gap 1 + 2 (session identity + ACL functions) | M | — |
+| 2 | F | Gap 3 (`IfThen` consumer + tests) | S | — |
+| 3 | G | Gap 4 (string kernel audit + fill) | S | — |
+| 4 | H | Gap 5 + 9 (UDF fallback + docs) | M | E, F, G |
+| 5 | I | Gap 7 (EventListener audit fields) | S | — |
+| 6 | — | Gap 8 (integration tests) | S | E, F, G, H, I |
+| 7 | — | Gap 6 (connector hooks) | S | Item 1 (upstream Trino SPI PR) |
+
+Agents E, F, G, I are independent and can land in parallel. H and the integration test pass are sequential after. Gap 6 is the only piece gated on metadata delegation.
+
+**Total size:** 3–4 weeks for gaps 1–5 and 7–9; gap 6 adds ~1 week once item 1's SPI PR ships.
