@@ -100,6 +100,7 @@ class PrismExchangeRoundTripTest {
 
     @Test
     void sinkAndSourceRoundTripPreservesPayloads() throws Exception {
+        assertTrue(manager.supportsConcurrentReadAndWrite());
         int outputPartitions = 6; // partitions > workerCount (=2), exercises mod
         Exchange exchange = manager.createExchange(ctx("ex_round_trip"), outputPartitions, false);
 
@@ -143,6 +144,78 @@ class PrismExchangeRoundTripTest {
         exchange.close();
 
         assertEquals(expectedContents, seen, "every written payload should come back exactly once");
+    }
+
+    @Test
+    void missingPartitionsReadBackAsEmptyAfterExchangeClose() throws Exception {
+        int outputPartitions = 4;
+        Exchange exchange = manager.createExchange(ctx("ex_empty"), outputPartitions, false);
+
+        ExchangeSinkHandle sinkHandle = exchange.addSink(0);
+        exchange.noMoreSinks();
+        ExchangeSinkInstanceHandle instanceHandle =
+                exchange.instantiateSink(sinkHandle, 0).get();
+
+        ExchangeSink sink = manager.createSink(instanceHandle);
+        sink.add(1, Slices.utf8Slice("only-written-partition"));
+        sink.finish().get();
+        exchange.sinkFinished(sinkHandle, 0);
+        exchange.allRequiredSinksFinished();
+
+        ExchangeSourceHandleSource.ExchangeSourceHandleBatch batch = exchange.getSourceHandles().getNextBatch().get();
+        for (InMemoryShuffleFlightProducer producer : producers) {
+            assertTrue(producer.isExchangeClosed("ex_empty"));
+        }
+
+        ExchangeSource source = manager.createSource();
+        source.addSourceHandles(batch.handles());
+        source.noMoreSourceHandles();
+
+        List<String> seen = new ArrayList<>();
+        while (!source.isFinished()) {
+            Slice read = source.read();
+            if (read != null) {
+                seen.add(read.toStringUtf8());
+            }
+        }
+        source.close();
+        exchange.close();
+
+        assertEquals(List.of("only-written-partition"), seen);
+    }
+
+    @Test
+    void sourceCloseDropsWorkerExchangeState() throws Exception {
+        int outputPartitions = 2;
+        Exchange exchange = manager.createExchange(ctx("ex_drop"), outputPartitions, false);
+
+        ExchangeSinkHandle sinkHandle = exchange.addSink(0);
+        exchange.noMoreSinks();
+        ExchangeSinkInstanceHandle instanceHandle =
+                exchange.instantiateSink(sinkHandle, 0).get();
+
+        ExchangeSink sink = manager.createSink(instanceHandle);
+        sink.add(0, Slices.utf8Slice("left"));
+        sink.add(1, Slices.utf8Slice("right"));
+        sink.finish().get();
+        exchange.sinkFinished(sinkHandle, 0);
+        exchange.allRequiredSinksFinished();
+
+        ExchangeSourceHandleSource.ExchangeSourceHandleBatch batch = exchange.getSourceHandles().getNextBatch().get();
+        ExchangeSource source = manager.createSource();
+        source.addSourceHandles(batch.handles());
+        source.noMoreSourceHandles();
+
+        while (!source.isFinished()) {
+            source.read();
+        }
+        source.close();
+        exchange.close();
+
+        for (InMemoryShuffleFlightProducer producer : producers) {
+            assertEquals(0, producer.partitionCount());
+            assertTrue(!producer.isExchangeClosed("ex_drop"));
+        }
     }
 
     @Test

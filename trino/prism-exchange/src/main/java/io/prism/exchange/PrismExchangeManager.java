@@ -36,12 +36,12 @@ import java.io.Closeable;
  *
  * <h2>Concurrent read/write</h2>
  *
- * <p>We return {@code false} from {@link #supportsConcurrentReadAndWrite}:
- * the Flight server's current {@code do_get} serves whatever is currently
- * in the {@code PartitionStore} and has no "wait for more data" semantic.
- * Concurrent read/write would require a Flight action to signal "partition
- * closed" before a reader could trust it has all batches. That's a
- * discrete feature — see report for the Rust-side Flight action request.</p>
+ * <p>We return {@code true} from {@link #supportsConcurrentReadAndWrite}.
+ * Prism still publishes source handles only after all sinks finish, but the
+ * worker-side Flight service now has explicit exchange lifecycle actions:
+ * {@code close_exchange} marks the exchange complete before readers start,
+ * and {@code drop_exchange} releases worker state when the exchange is torn
+ * down.</p>
  */
 public final class PrismExchangeManager implements ExchangeManager, Closeable {
 
@@ -92,7 +92,7 @@ public final class PrismExchangeManager implements ExchangeManager, Closeable {
 
     @Override
     public boolean supportsConcurrentReadAndWrite() {
-        return false;
+        return true;
     }
 
     @Override

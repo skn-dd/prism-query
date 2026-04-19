@@ -51,6 +51,8 @@ public final class PrismExchange implements Exchange {
 
     private final AtomicBoolean noMoreSinks = new AtomicBoolean(false);
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final AtomicBoolean exchangeClosedOnWorkers = new AtomicBoolean(false);
+    private final AtomicBoolean exchangeDroppedOnWorkers = new AtomicBoolean(false);
     private final CompletableFuture<Void> allSinksDoneFuture = new CompletableFuture<>();
 
     public PrismExchange(ExchangeContext context,
@@ -131,6 +133,18 @@ public final class PrismExchange implements Exchange {
         return new PrismSourceHandleSource();
     }
 
+    private void closeExchangeOnWorkers() {
+        if (exchangeClosedOnWorkers.compareAndSet(false, true)) {
+            clientPool.runExchangeActionOnAllWorkers("close_exchange", getId().getId());
+        }
+    }
+
+    private void dropExchangeOnWorkers() {
+        if (exchangeDroppedOnWorkers.compareAndSet(false, true)) {
+            clientPool.runExchangeActionOnAllWorkers("drop_exchange", getId().getId());
+        }
+    }
+
     private PrismExchangeSinkHandle expect(ExchangeSinkHandle handle) {
         if (handle instanceof PrismExchangeSinkHandle p) {
             return p;
@@ -142,6 +156,7 @@ public final class PrismExchange implements Exchange {
     @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
+            dropExchangeOnWorkers();
             // The Flight client pool is shared across exchanges and closed
             // by PrismExchangeManager.shutdown(). Nothing per-exchange to
             // release — sinks/sources manage their own streams.
@@ -170,6 +185,7 @@ public final class PrismExchange implements Exchange {
                         new ExchangeSourceHandleBatch(List.of(), /*lastBatch=*/ true));
             }
             return allSinksDoneFuture.thenApply(v -> {
+                closeExchangeOnWorkers();
                 List<ExchangeSourceHandle> handles = new ArrayList<>(outputPartitionCount);
                 for (int p = 0; p < outputPartitionCount; p++) {
                     int workerIndex = router.workerFor(p);

@@ -2,6 +2,7 @@ package io.prism.exchange;
 
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.Action;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.slf4j.Logger;
@@ -11,6 +12,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -102,6 +104,32 @@ public final class PrismFlightClientPool implements Closeable {
 
     public BufferAllocator allocator() {
         return allocator;
+    }
+
+    public void runExchangeAction(int workerIndex, String actionType, String exchangeId) {
+        Objects.requireNonNull(actionType, "actionType");
+        Objects.requireNonNull(exchangeId, "exchangeId");
+
+        FlightClient client = client(workerIndex);
+        Action action = new Action(actionType, exchangeId.getBytes(StandardCharsets.UTF_8));
+        try {
+            var results = client.doAction(action);
+            while (results.hasNext()) {
+                results.next();
+            }
+        }
+        catch (Exception e) {
+            throw new IllegalStateException(
+                    "Flight action " + actionType + " failed for exchange " + exchangeId
+                            + " on worker " + endpoint(workerIndex),
+                    e);
+        }
+    }
+
+    public void runExchangeActionOnAllWorkers(String actionType, String exchangeId) {
+        for (int workerIndex = 0; workerIndex < workerCount(); workerIndex++) {
+            runExchangeAction(workerIndex, actionType, exchangeId);
+        }
     }
 
     @Override

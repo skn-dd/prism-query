@@ -3,8 +3,12 @@ package io.prism.exchange;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightProducer;
 import org.apache.arrow.flight.FlightStream;
+import org.apache.arrow.flight.Action;
+import org.apache.arrow.flight.ActionType;
+import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.NoOpFlightProducer;
 import org.apache.arrow.flight.PutResult;
+import org.apache.arrow.flight.Result;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -16,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -40,6 +45,7 @@ final class InMemoryShuffleFlightProducer extends NoOpFlightProducer {
 
     private final BufferAllocator allocator;
     private final Map<String, StoredPartition> store = new ConcurrentHashMap<>();
+    private final Set<String> closedExchanges = ConcurrentHashMap.newKeySet();
 
     InMemoryShuffleFlightProducer(BufferAllocator allocator) {
         this.allocator = allocator;
@@ -51,6 +57,16 @@ final class InMemoryShuffleFlightProducer extends NoOpFlightProducer {
 
     boolean containsKey(String key) {
         return store.containsKey(key);
+    }
+
+    boolean isExchangeClosed(String exchangeId) {
+        return closedExchanges.contains(exchangeId);
+    }
+
+    private static void closeStoredPartition(StoredPartition storedPartition) {
+        for (ArrowRecordBatch batch : storedPartition.batches) {
+            batch.close();
+        }
     }
 
     @Override
@@ -82,7 +98,7 @@ final class InMemoryShuffleFlightProducer extends NoOpFlightProducer {
         String key = new String(ticket.getBytes(), StandardCharsets.UTF_8);
         StoredPartition stored = store.get(key);
         if (stored == null) {
-            listener.error(new RuntimeException("partition not found: " + key));
+            listener.error(CallStatus.NOT_FOUND.withDescription("partition not found: " + key).toRuntimeException());
             return;
         }
         try (VectorSchemaRoot root = VectorSchemaRoot.create(stored.schema, allocator)) {
@@ -96,13 +112,45 @@ final class InMemoryShuffleFlightProducer extends NoOpFlightProducer {
         }
     }
 
+    @Override
+    public void doAction(CallContext context, Action action, StreamListener<Result> listener) {
+        String exchangeId = new String(action.getBody(), StandardCharsets.UTF_8);
+        switch (action.getType()) {
+            case "close_exchange" -> {
+                closedExchanges.add(exchangeId);
+                listener.onNext(new Result("closed".getBytes(StandardCharsets.UTF_8)));
+                listener.onCompleted();
+            }
+            case "drop_exchange" -> {
+                String prefix = "exchange/" + exchangeId + "/";
+                store.entrySet().removeIf(entry -> {
+                    if (!entry.getKey().startsWith(prefix)) {
+                        return false;
+                    }
+                    closeStoredPartition(entry.getValue());
+                    return true;
+                });
+                closedExchanges.remove(exchangeId);
+                listener.onNext(new Result("dropped".getBytes(StandardCharsets.UTF_8)));
+                listener.onCompleted();
+            }
+            default -> listener.onError(new UnsupportedOperationException("unknown action: " + action.getType()));
+        }
+    }
+
+    @Override
+    public void listActions(CallContext context, StreamListener<ActionType> listener) {
+        listener.onNext(new ActionType("close_exchange", "Mark an exchange closed."));
+        listener.onNext(new ActionType("drop_exchange", "Drop all exchange state."));
+        listener.onCompleted();
+    }
+
     /** Release all captured ArrowRecordBatches. Call during test teardown. */
     void closeAll() {
         for (StoredPartition p : store.values()) {
-            for (ArrowRecordBatch b : p.batches) {
-                b.close();
-            }
+            closeStoredPartition(p);
         }
         store.clear();
+        closedExchanges.clear();
     }
 }

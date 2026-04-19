@@ -8,6 +8,7 @@ import io.trino.spi.exchange.ExchangeSourceOutputSelector;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Ticket;
+import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.vector.LargeVarBinaryVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.slf4j.Logger;
@@ -16,7 +17,9 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -37,6 +40,7 @@ public final class PrismExchangeSource implements ExchangeSource {
 
     private final PrismFlightClientPool clientPool;
     private final Deque<PrismExchangeSourceHandle> pendingHandles = new ArrayDeque<>();
+    private final Set<String> exchangeIds = new HashSet<>();
 
     private boolean noMoreHandles;
     private boolean closed;
@@ -60,6 +64,7 @@ public final class PrismExchangeSource implements ExchangeSource {
                         "Expected PrismExchangeSourceHandle, got " + h.getClass().getName());
             }
             pendingHandles.add(ph);
+            exchangeIds.add(ph.getExchangeId().getId());
         }
     }
 
@@ -129,16 +134,41 @@ public final class PrismExchangeSource implements ExchangeSource {
         String storageKey = PrismPartitionRouter.storageKey(
                 h.getExchangeId().getId(), h.getPartitionId());
         Ticket ticket = new Ticket(storageKey.getBytes(StandardCharsets.UTF_8));
-        FlightStream stream = client.getStream(ticket);
-        if (!stream.next()) {
-            // Empty partition (sink wrote zero rows). Close and move on.
+        FlightStream stream;
+        try {
+            stream = client.getStream(ticket);
+        }
+        catch (FlightRuntimeException e) {
+            if (isMissingPartition(e)) {
+                LOG.debug("Treating missing closed partition {} as empty", storageKey);
+                return;
+            }
+            throw e;
+        }
+        try {
+            if (!stream.next()) {
+                // Empty partition (sink wrote zero rows). Close and move on.
+                try {
+                    stream.close();
+                }
+                catch (Exception e) {
+                    LOG.debug("Error closing empty stream for {}: {}", storageKey, e.getMessage());
+                }
+                return;
+            }
+        }
+        catch (FlightRuntimeException e) {
             try {
                 stream.close();
             }
-            catch (Exception e) {
-                LOG.debug("Error closing empty stream for {}: {}", storageKey, e.getMessage());
+            catch (Exception closeError) {
+                LOG.debug("Error closing failed stream for {}: {}", storageKey, closeError.getMessage());
             }
-            return;
+            if (isMissingPartition(e)) {
+                LOG.debug("Treating missing closed partition {} as empty", storageKey);
+                return;
+            }
+            throw e;
         }
         currentStream = stream;
         rebindCurrentBatch();
@@ -150,6 +180,15 @@ public final class PrismExchangeSource implements ExchangeSource {
                 PrismExchangePayloadSchema.PAYLOAD_FIELD);
         currentRowCount = root.getRowCount();
         currentRow = 0;
+    }
+
+    private boolean isMissingPartition(FlightRuntimeException e) {
+        String message = e.getMessage();
+        if (message == null) {
+            return false;
+        }
+        String normalized = message.toLowerCase();
+        return normalized.contains("not found") || normalized.contains("not_found");
     }
 
     private void closeCurrentStream() {
@@ -182,6 +221,15 @@ public final class PrismExchangeSource implements ExchangeSource {
         closed = true;
         closeCurrentStream();
         pendingHandles.clear();
+        for (String exchangeId : exchangeIds) {
+            try {
+                clientPool.runExchangeActionOnAllWorkers("drop_exchange", exchangeId);
+            }
+            catch (RuntimeException e) {
+                LOG.warn("Failed to drop exchange {}: {}", exchangeId, e.getMessage());
+            }
+        }
+        exchangeIds.clear();
         LOG.debug("PrismExchangeSource closed: bytes={}", bytesRead);
     }
 }

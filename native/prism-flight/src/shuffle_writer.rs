@@ -6,14 +6,13 @@
 //! - `do_put`:    Receive RecordBatches from coordinator, store by descriptor path
 //! - `do_action`: Execute commands (query execution, status checks)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int32Type, Int64Type, Float64Type};
+use arrow_array::types::{Float64Type, Int32Type, Int64Type};
+use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
@@ -26,8 +25,6 @@ use futures::stream::{self, BoxStream, StreamExt};
 use futures::TryStreamExt;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status, Streaming};
-
-use crate::PartitionId;
 
 /// Trait for handling `do_action` "execute" commands.
 /// Workers implement this to execute query plans against local data.
@@ -44,10 +41,13 @@ pub trait ActionHandler: Send + Sync + 'static {
 #[derive(Default)]
 pub struct PartitionStore {
     partitions: RwLock<HashMap<String, Vec<RecordBatch>>>,
+    closed_exchanges: RwLock<HashSet<String>>,
 }
 
 impl PartitionStore {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub async fn put(&self, key: &str, batch: RecordBatch) {
         let mut map = self.partitions.write().await;
@@ -63,6 +63,26 @@ impl PartitionStore {
         let mut map = self.partitions.write().await;
         map.remove(key);
     }
+
+    pub async fn close_exchange(&self, exchange_id: &str) {
+        let mut closed = self.closed_exchanges.write().await;
+        closed.insert(exchange_id.to_string());
+    }
+
+    pub async fn is_exchange_closed(&self, exchange_id: &str) -> bool {
+        let closed = self.closed_exchanges.read().await;
+        closed.contains(exchange_id)
+    }
+
+    pub async fn drop_exchange(&self, exchange_id: &str) {
+        let prefix = format!("exchange/{exchange_id}/");
+        {
+            let mut map = self.partitions.write().await;
+            map.retain(|key, _| !key.starts_with(&prefix));
+        }
+        let mut closed = self.closed_exchanges.write().await;
+        closed.remove(exchange_id);
+    }
 }
 
 /// Partition a RecordBatch by hash of specified key columns into N output partitions.
@@ -71,8 +91,12 @@ pub fn partition_batch(
     partition_keys: &[usize],
     num_partitions: usize,
 ) -> anyhow::Result<Vec<RecordBatch>> {
-    if num_partitions == 0 { return Ok(vec![]); }
-    if num_partitions == 1 { return Ok(vec![batch.clone()]); }
+    if num_partitions == 0 {
+        return Ok(vec![]);
+    }
+    if num_partitions == 1 {
+        return Ok(vec![batch.clone()]);
+    }
 
     let num_rows = batch.num_rows();
 
@@ -89,7 +113,9 @@ pub fn partition_batch(
             output.push(RecordBatch::new_empty(batch.schema()));
         } else {
             let idx_array = UInt32Array::from(indices.clone());
-            let columns: Vec<_> = batch.columns().iter()
+            let columns: Vec<_> = batch
+                .columns()
+                .iter()
                 .map(|col| arrow::compute::take(col, &idx_array, None))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             output.push(RecordBatch::try_new(batch.schema(), columns)?);
@@ -109,11 +135,18 @@ fn hash_row(batch: &RecordBatch, key_cols: &[usize], row: usize) -> u64 {
 }
 
 fn hash_value(array: &dyn Array, row: usize, hasher: &mut impl Hasher) {
-    if array.is_null(row) { 0u8.hash(hasher); return; }
+    if array.is_null(row) {
+        0u8.hash(hasher);
+        return;
+    }
     match array.data_type() {
         DataType::Int32 => array.as_primitive::<Int32Type>().value(row).hash(hasher),
         DataType::Int64 => array.as_primitive::<Int64Type>().value(row).hash(hasher),
-        DataType::Float64 => array.as_primitive::<Float64Type>().value(row).to_bits().hash(hasher),
+        DataType::Float64 => array
+            .as_primitive::<Float64Type>()
+            .value(row)
+            .to_bits()
+            .hash(hasher),
         DataType::Utf8 => array.as_string::<i32>().value(row).hash(hasher),
         _ => format!("{:?}", array.slice(row, 1)).hash(hasher),
     }
@@ -139,7 +172,9 @@ impl ShuffleFlightService {
         *self.action_handler.write().await = Some(handler);
     }
 
-    pub fn into_server(self) -> FlightServiceServer<Self> { FlightServiceServer::new(self) }
+    pub fn into_server(self) -> FlightServiceServer<Self> {
+        FlightServiceServer::new(self)
+    }
 }
 
 #[tonic::async_trait]
@@ -152,27 +187,45 @@ impl FlightService for ShuffleFlightService {
     type ListActionsStream = BoxStream<'static, Result<ActionType, Status>>;
     type DoExchangeStream = BoxStream<'static, Result<FlightData, Status>>;
 
-    async fn handshake(&self, _req: Request<Streaming<HandshakeRequest>>) -> Result<Response<Self::HandshakeStream>, Status> {
+    async fn handshake(
+        &self,
+        _req: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<Response<Self::HandshakeStream>, Status> {
         Err(Status::unimplemented("handshake"))
     }
-    async fn list_flights(&self, _req: Request<Criteria>) -> Result<Response<Self::ListFlightsStream>, Status> {
+    async fn list_flights(
+        &self,
+        _req: Request<Criteria>,
+    ) -> Result<Response<Self::ListFlightsStream>, Status> {
         Err(Status::unimplemented("list_flights"))
     }
-    async fn get_flight_info(&self, _req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
+    async fn get_flight_info(
+        &self,
+        _req: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
         Err(Status::unimplemented("get_flight_info"))
     }
-    async fn get_schema(&self, _req: Request<FlightDescriptor>) -> Result<Response<SchemaResult>, Status> {
+    async fn get_schema(
+        &self,
+        _req: Request<FlightDescriptor>,
+    ) -> Result<Response<SchemaResult>, Status> {
         Err(Status::unimplemented("get_schema"))
     }
 
-    async fn do_get(&self, request: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = request.into_inner();
         let partition_key = String::from_utf8(ticket.ticket.to_vec())
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         let batches = self.store.get(&partition_key).await;
         if batches.is_empty() {
-            return Err(Status::not_found(format!("partition {} not found", partition_key)));
+            return Err(Status::not_found(format!(
+                "partition {} not found",
+                partition_key
+            )));
         }
 
         let schema = batches[0].schema();
@@ -184,14 +237,20 @@ impl FlightService for ShuffleFlightService {
         Ok(Response::new(Box::pin(flight_stream)))
     }
 
-    async fn do_put(&self, request: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
+    async fn do_put(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoPutStream>, Status> {
         let mut stream = request.into_inner();
 
         // First message should contain the FlightDescriptor with the storage key
-        let first = stream.message().await?
+        let first = stream
+            .message()
+            .await?
             .ok_or_else(|| Status::invalid_argument("empty do_put stream"))?;
 
-        let descriptor = first.flight_descriptor
+        let descriptor = first
+            .flight_descriptor
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("first FlightData must have descriptor"))?;
         let key = String::from_utf8(descriptor.cmd.to_vec())
@@ -202,13 +261,16 @@ impl FlightService for ShuffleFlightService {
             .map_err(|e: Status| e)?;
 
         if key.is_empty() {
-            return Err(Status::invalid_argument("descriptor must have cmd or path for storage key"));
+            return Err(Status::invalid_argument(
+                "descriptor must have cmd or path for storage key",
+            ));
         }
 
         // Decode all FlightData into RecordBatches
         let flight_stream = FlightRecordBatchStream::new_from_flight_data(
-            futures::stream::once(async { Ok(first) })
-                .chain(stream.map(|r| r.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e)))))
+            futures::stream::once(async { Ok(first) }).chain(
+                stream.map(|r| r.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e)))),
+            ),
         );
         let batches: Vec<RecordBatch> = flight_stream
             .try_collect()
@@ -222,68 +284,144 @@ impl FlightService for ShuffleFlightService {
 
         tracing::info!("do_put: stored {} rows under key '{}'", total_rows, key);
 
-        let result = PutResult { app_metadata: format!("stored {} rows", total_rows).into() };
+        let result = PutResult {
+            app_metadata: format!("stored {} rows", total_rows).into(),
+        };
         let output = futures::stream::once(async { Ok(result) });
         Ok(Response::new(Box::pin(output)))
     }
 
-    async fn do_action(&self, request: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
+    async fn do_action(
+        &self,
+        request: Request<Action>,
+    ) -> Result<Response<Self::DoActionStream>, Status> {
         let action = request.into_inner();
         let action_type = action.r#type.as_str();
 
         match action_type {
             "ping" => {
-                let result = arrow_flight::Result { body: "pong".into() };
-                Ok(Response::new(Box::pin(futures::stream::once(async { Ok(result) }))))
+                let result = arrow_flight::Result {
+                    body: "pong".into(),
+                };
+                Ok(Response::new(Box::pin(futures::stream::once(async {
+                    Ok(result)
+                }))))
             }
             "list_keys" => {
                 let map = self.store.partitions.read().await;
                 let keys: Vec<String> = map.keys().cloned().collect();
-                let body = serde_json::to_vec(&keys)
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                let body =
+                    serde_json::to_vec(&keys).map_err(|e| Status::internal(e.to_string()))?;
                 let result = arrow_flight::Result { body: body.into() };
-                Ok(Response::new(Box::pin(futures::stream::once(async { Ok(result) }))))
+                Ok(Response::new(Box::pin(futures::stream::once(async {
+                    Ok(result)
+                }))))
             }
             "execute" => {
                 // Body is JSON: { "substrait_plan_b64": "...", "tables": {"name": "key"}, "result_key": "..." }
                 let cmd: serde_json::Value = serde_json::from_slice(&action.body)
                     .map_err(|e| Status::invalid_argument(format!("invalid JSON: {}", e)))?;
 
-                let result_key = cmd["result_key"].as_str()
+                let result_key = cmd["result_key"]
+                    .as_str()
                     .ok_or_else(|| Status::invalid_argument("missing result_key"))?
                     .to_string();
 
                 // Dispatch to the action handler (set externally)
                 if let Some(handler) = &*self.action_handler.read().await {
-                    let result_batch = handler.execute(cmd, &self.store).await
+                    let result_batch = handler
+                        .execute(cmd, &self.store)
+                        .await
                         .map_err(|e| Status::internal(format!("execution failed: {}", e)))?;
 
                     self.store.put(&result_key, result_batch).await;
 
                     let result = arrow_flight::Result {
-                        body: format!("{{\"status\":\"ok\",\"result_key\":\"{}\"}}", result_key).into(),
+                        body: format!("{{\"status\":\"ok\",\"result_key\":\"{}\"}}", result_key)
+                            .into(),
                     };
-                    Ok(Response::new(Box::pin(futures::stream::once(async { Ok(result) }))))
+                    Ok(Response::new(Box::pin(futures::stream::once(async {
+                        Ok(result)
+                    }))))
                 } else {
                     Err(Status::unimplemented("no action handler registered"))
                 }
             }
-            _ => Err(Status::unimplemented(format!("unknown action type: {}", action_type))),
+            "close_exchange" => {
+                let exchange_id = std::str::from_utf8(&action.body)
+                    .map_err(|e| Status::invalid_argument(format!("invalid exchange id: {}", e)))?
+                    .trim();
+                if exchange_id.is_empty() {
+                    return Err(Status::invalid_argument("missing exchange id"));
+                }
+                self.store.close_exchange(exchange_id).await;
+                let result = arrow_flight::Result {
+                    body: b"closed".as_slice().into(),
+                };
+                Ok(Response::new(Box::pin(futures::stream::once(async {
+                    Ok(result)
+                }))))
+            }
+            "drop_exchange" => {
+                let exchange_id = std::str::from_utf8(&action.body)
+                    .map_err(|e| Status::invalid_argument(format!("invalid exchange id: {}", e)))?
+                    .trim();
+                if exchange_id.is_empty() {
+                    return Err(Status::invalid_argument("missing exchange id"));
+                }
+                self.store.drop_exchange(exchange_id).await;
+                let result = arrow_flight::Result {
+                    body: b"dropped".as_slice().into(),
+                };
+                Ok(Response::new(Box::pin(futures::stream::once(async {
+                    Ok(result)
+                }))))
+            }
+            _ => Err(Status::unimplemented(format!(
+                "unknown action type: {}",
+                action_type
+            ))),
         }
     }
 
-    async fn list_actions(&self, _req: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
+    async fn list_actions(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<Self::ListActionsStream>, Status> {
         let actions = vec![
-            Ok(ActionType { r#type: "ping".into(), description: "Health check".into() }),
-            Ok(ActionType { r#type: "list_keys".into(), description: "List stored partition keys".into() }),
-            Ok(ActionType { r#type: "execute".into(), description: "Execute a query plan".into() }),
+            Ok(ActionType {
+                r#type: "ping".into(),
+                description: "Health check".into(),
+            }),
+            Ok(ActionType {
+                r#type: "list_keys".into(),
+                description: "List stored partition keys".into(),
+            }),
+            Ok(ActionType {
+                r#type: "execute".into(),
+                description: "Execute a query plan".into(),
+            }),
+            Ok(ActionType {
+                r#type: "close_exchange".into(),
+                description: "Mark an exchange as closed for reading.".into(),
+            }),
+            Ok(ActionType {
+                r#type: "drop_exchange".into(),
+                description: "Drop all worker state for an exchange.".into(),
+            }),
         ];
         Ok(Response::new(Box::pin(futures::stream::iter(actions))))
     }
-    async fn do_exchange(&self, _req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> {
+    async fn do_exchange(
+        &self,
+        _req: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoExchangeStream>, Status> {
         Err(Status::unimplemented("do_exchange"))
     }
-    async fn poll_flight_info(&self, _req: Request<FlightDescriptor>) -> Result<Response<arrow_flight::PollInfo>, Status> {
+    async fn poll_flight_info(
+        &self,
+        _req: Request<FlightDescriptor>,
+    ) -> Result<Response<arrow_flight::PollInfo>, Status> {
         Err(Status::unimplemented("poll_flight_info"))
     }
 }
@@ -299,10 +437,16 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("region", DataType::Utf8, false),
         ]));
-        RecordBatch::try_new(schema, vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8])),
-            Arc::new(StringArray::from(vec!["east", "west", "east", "north", "west", "east", "north", "west"])),
-        ]).unwrap()
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8])),
+                Arc::new(StringArray::from(vec![
+                    "east", "west", "east", "north", "west", "east", "north", "west",
+                ])),
+            ],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -323,5 +467,22 @@ mod tests {
         assert_eq!(store.get("s1/p0").await.len(), 2);
         store.clear("s1/p0").await;
         assert!(store.get("s1/p0").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_exchange_lifecycle_actions() {
+        let store = PartitionStore::new();
+        let batch = test_batch();
+        store.put("exchange/ex1/0", batch.clone()).await;
+        store.put("exchange/ex1/1", batch).await;
+
+        assert!(!store.is_exchange_closed("ex1").await);
+        store.close_exchange("ex1").await;
+        assert!(store.is_exchange_closed("ex1").await);
+
+        store.drop_exchange("ex1").await;
+        assert!(store.get("exchange/ex1/0").await.is_empty());
+        assert!(store.get("exchange/ex1/1").await.is_empty());
+        assert!(!store.is_exchange_closed("ex1").await);
     }
 }

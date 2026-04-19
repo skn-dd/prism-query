@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow::compute::kernels::aggregate as arrow_agg;
 use arrow_array::{
     cast::AsArray, Array, ArrayRef, Float64Array, Int64Array, RecordBatch,
-    types::{Float64Type, Int32Type, Int64Type},
+    types::{Date32Type, Float64Type, Int32Type, Int64Type},
 };
 use arrow_cast::cast;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -106,7 +106,18 @@ struct GroupAccumulator {
     count: u64,
     min: f64,
     max: f64,
-    distinct_hashes: Option<HashSet<u64>>,
+    distinct_values: Option<HashSet<DistinctValue>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DistinctValue {
+    Int32(i32),
+    Int64(i64),
+    Float64(u64),
+    Utf8(String),
+    Boolean(bool),
+    Date32(i32),
+    Fallback(String),
 }
 
 impl GroupAccumulator {
@@ -116,7 +127,7 @@ impl GroupAccumulator {
             count: 0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
-            distinct_hashes: if track_distinct { Some(HashSet::new()) } else { None },
+            distinct_values: if track_distinct { Some(HashSet::new()) } else { None },
         }
     }
 
@@ -126,8 +137,12 @@ impl GroupAccumulator {
         self.count += 1;
         if value < self.min { self.min = value; }
         if value > self.max { self.max = value; }
-        if let Some(ref mut dv) = self.distinct_hashes {
-            dv.insert(value.to_bits());
+    }
+
+    #[inline(always)]
+    fn accumulate_distinct(&mut self, value: DistinctValue) {
+        if let Some(ref mut dv) = self.distinct_values {
+            dv.insert(value);
         }
     }
 
@@ -136,9 +151,9 @@ impl GroupAccumulator {
         self.count += other.count;
         if other.min < self.min { self.min = other.min; }
         if other.max > self.max { self.max = other.max; }
-        if let (Some(ref mut dv), Some(ref other_dv)) = (&mut self.distinct_hashes, &other.distinct_hashes) {
-            for &v in other_dv {
-                dv.insert(v);
+        if let (Some(ref mut dv), Some(ref other_dv)) = (&mut self.distinct_values, &other.distinct_values) {
+            for v in other_dv {
+                dv.insert(v.clone());
             }
         }
     }
@@ -150,7 +165,7 @@ impl GroupAccumulator {
             AggFunc::Avg => if self.count > 0 { self.sum / self.count as f64 } else { 0.0 },
             AggFunc::Min => if self.count > 0 { self.min } else { 0.0 },
             AggFunc::Max => if self.count > 0 { self.max } else { 0.0 },
-            AggFunc::CountDistinct => self.distinct_hashes.as_ref().map_or(0, |v| v.len()) as f64,
+            AggFunc::CountDistinct => self.distinct_values.as_ref().map_or(0, |v| v.len()) as f64,
         }
     }
 }
@@ -209,16 +224,22 @@ pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -
             for &(batch_idx, batch) in chunk {
                 let num_rows = batch.num_rows();
 
-                let agg_arrays: Vec<Float64Array> = config.aggregates.iter()
+                let agg_arrays: Vec<Option<Float64Array>> = config.aggregates.iter()
                     .map(|agg| {
-                        let col = batch.column(agg.column);
-                        if col.data_type() == &DataType::Float64 {
-                            col.as_primitive::<Float64Type>().clone()
+                        if agg.func == AggFunc::CountDistinct {
+                            None
                         } else {
-                            cast(col, &DataType::Float64)
-                                .expect("cast to f64")
-                                .as_primitive::<Float64Type>()
-                                .clone()
+                            let col = batch.column(agg.column);
+                            if col.data_type() == &DataType::Float64 {
+                                Some(col.as_primitive::<Float64Type>().clone())
+                            } else {
+                                Some(
+                                    cast(col, &DataType::Float64)
+                                        .expect("cast to f64")
+                                        .as_primitive::<Float64Type>()
+                                        .clone()
+                                )
+                            }
                         }
                     })
                     .collect();
@@ -233,8 +254,17 @@ pub fn hash_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -
                         (batch_idx, row, accums)
                     });
 
-                    for (agg_idx, _agg) in config.aggregates.iter().enumerate() {
-                        let value = agg_arrays[agg_idx].value(row);
+                    for (agg_idx, agg) in config.aggregates.iter().enumerate() {
+                        if agg.func == AggFunc::CountDistinct {
+                            if let Some(value) = distinct_value(batch.column(agg.column), row) {
+                                entry.2[agg_idx].accumulate_distinct(value);
+                            }
+                            continue;
+                        }
+                        let value = agg_arrays[agg_idx]
+                            .as_ref()
+                            .expect("numeric aggregate must precompute cast array")
+                            .value(row);
                         entry.2[agg_idx].accumulate(value);
                     }
                 }
@@ -383,21 +413,19 @@ fn global_aggregate_batches(batches: &[RecordBatch], config: &HashAggConfig) -> 
                 if global_max == f64::NEG_INFINITY { 0.0 } else { global_max }
             }
             AggFunc::CountDistinct => {
-                let partial_sets: Vec<HashSet<u64>> = batches.par_iter()
+                let partial_sets: Vec<HashSet<DistinctValue>> = batches.par_iter()
                     .map(|batch| {
                         let mut set = HashSet::new();
-                        if let Ok(f64_col) = cast_to_f64(batch.column(agg.column)) {
-                            let arr = f64_col.as_primitive::<Float64Type>();
-                            for i in 0..arr.len() {
-                                if !arr.is_null(i) {
-                                    set.insert(arr.value(i).to_bits());
-                                }
+                        let col = batch.column(agg.column);
+                        for i in 0..col.len() {
+                            if let Some(value) = distinct_value(col, i) {
+                                set.insert(value);
                             }
                         }
                         set
                     })
                     .collect();
-                let mut merged: HashSet<u64> = HashSet::new();
+                let mut merged: HashSet<DistinctValue> = HashSet::new();
                 for set in partial_sets {
                     merged.extend(set);
                 }
@@ -424,6 +452,32 @@ fn cast_to_f64(array: &ArrayRef) -> Result<ArrayRef> {
     } else {
         Ok(arrow_cast::cast(array, &DataType::Float64)?)
     }
+}
+
+fn distinct_value(array: &ArrayRef, row: usize) -> Option<DistinctValue> {
+    if array.is_null(row) {
+        return None;
+    }
+
+    Some(match array.data_type() {
+        DataType::Int32 => DistinctValue::Int32(array.as_primitive::<Int32Type>().value(row)),
+        DataType::Int64 => DistinctValue::Int64(array.as_primitive::<Int64Type>().value(row)),
+        DataType::Float64 => {
+            let value = array.as_primitive::<Float64Type>().value(row);
+            let bits = if value == 0.0 {
+                0.0f64.to_bits()
+            } else if value.is_nan() {
+                f64::NAN.to_bits()
+            } else {
+                value.to_bits()
+            };
+            DistinctValue::Float64(bits)
+        }
+        DataType::Utf8 => DistinctValue::Utf8(array.as_string::<i32>().value(row).to_owned()),
+        DataType::Boolean => DistinctValue::Boolean(array.as_boolean().value(row)),
+        DataType::Date32 => DistinctValue::Date32(array.as_primitive::<Date32Type>().value(row)),
+        _ => DistinctValue::Fallback(format!("{:?}", array.slice(row, 1))),
+    })
 }
 
 fn hash_group_keys(batch: &RecordBatch, key_cols: &[usize], row: usize) -> u64 {
@@ -527,5 +581,81 @@ mod tests {
         let result = hash_aggregate(&sales_batch(), &config).unwrap();
         assert_eq!(result.num_rows(), 2);
         assert_eq!(result.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_global_count_distinct_preserves_large_int64_values() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![
+                Some(9_007_199_254_740_992_i64),
+                Some(9_007_199_254_740_993_i64),
+                Some(9_007_199_254_740_992_i64),
+                None,
+            ]))],
+        )
+        .unwrap();
+
+        let config = HashAggConfig {
+            group_by: vec![],
+            aggregates: vec![AggExpr {
+                column: 0,
+                func: AggFunc::CountDistinct,
+                output_name: "distinct_ids".into(),
+            }],
+        };
+
+        let result = hash_aggregate(&batch, &config).unwrap();
+        let counts = result.column(0).as_primitive::<Int64Type>();
+        assert_eq!(counts.value(0), 2);
+    }
+
+    #[test]
+    fn test_grouped_count_distinct_supports_utf8() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["east", "east", "east", "west", "west", "west"])),
+                Arc::new(StringArray::from(vec![
+                    Some("A"),
+                    Some("A"),
+                    Some("B"),
+                    Some("A"),
+                    None,
+                    Some("C"),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let config = HashAggConfig {
+            group_by: vec![0],
+            aggregates: vec![AggExpr {
+                column: 1,
+                func: AggFunc::CountDistinct,
+                output_name: "distinct_labels".into(),
+            }],
+        };
+
+        let result = hash_aggregate(&batch, &config).unwrap();
+        let groups = result.column(0).as_string::<i32>();
+        let counts = result.column(1).as_primitive::<Int64Type>();
+
+        let mut seen = HashMap::new();
+        for row in 0..result.num_rows() {
+            seen.insert(groups.value(row).to_owned(), counts.value(row));
+        }
+
+        assert_eq!(seen.get("east"), Some(&2));
+        assert_eq!(seen.get("west"), Some(&2));
     }
 }
