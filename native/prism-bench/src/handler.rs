@@ -18,10 +18,13 @@ use serde::Deserialize;
 use tonic::transport::Channel;
 
 use prism_executor::hash_aggregate::{AggExpr, AggFunc, HashAggConfig};
-use prism_executor::parquet_scan::{ParquetScanConfig, parquet_scan, parquet_row_count};
+use prism_executor::parquet_scan::{parquet_row_count, parquet_scan, ParquetScanConfig};
 use prism_flight::shuffle_writer::{ActionHandler, PartitionStore};
+use prism_substrait::consumer::SessionContext;
 use prism_substrait::plan::PlanNode;
-use prism_substrait::plan_opt::{ScanHint, extract_scan_hints, extract_projection_hints, detect_count_star};
+use prism_substrait::plan_opt::{
+    detect_count_star, extract_projection_hints, extract_scan_hints, ScanHint,
+};
 
 use crate::{datagen, queries};
 
@@ -84,8 +87,17 @@ impl ActionHandler for QueryHandler {
                 .map_err(|e| anyhow::anyhow!("base64 decode error: {}", e))?;
 
             let start = Instant::now();
-            let plan = prism_substrait::consumer::consume_plan(&plan_bytes)
-                .map_err(|e| anyhow::anyhow!("Substrait consume error: {}", e))?;
+            let session_context = command
+                .get("session_context")
+                .cloned()
+                .map(serde_json::from_value::<SessionContext>)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("session context decode error: {}", e))?;
+            let plan = prism_substrait::consumer::consume_plan_with_context(
+                &plan_bytes,
+                session_context.as_ref(),
+            )
+            .map_err(|e| anyhow::anyhow!("Substrait consume error: {}", e))?;
 
             // Extract scan hints for Parquet row group skipping + column pruning
             let mut hints = extract_scan_hints(&plan.root);
@@ -123,10 +135,11 @@ impl ActionHandler for QueryHandler {
                                 start.elapsed().as_secs_f64() * 1000.0,
                             );
 
-                            let schema = Arc::new(Schema::new(vec![
-                                Field::new(&plan.root.aggregate_output_name().unwrap_or("cnt".into()),
-                                           DataType::Int64, true),
-                            ]));
+                            let schema = Arc::new(Schema::new(vec![Field::new(
+                                &plan.root.aggregate_output_name().unwrap_or("cnt".into()),
+                                DataType::Int64,
+                                true,
+                            )]));
                             return Ok(RecordBatch::try_new(
                                 schema,
                                 vec![Arc::new(Int64Array::from(vec![count as i64]))],
@@ -137,7 +150,8 @@ impl ActionHandler for QueryHandler {
             }
 
             // Load tables — Parquet with pushdown if available, else in-memory
-            let (tables, col_remaps) = load_tables_smart(&command, store, self.data_dir.as_deref(), &hints).await?;
+            let (tables, col_remaps) =
+                load_tables_smart(&command, store, self.data_dir.as_deref(), &hints).await?;
             for (t, batches) in &tables {
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 let cols = batches.first().map(|b| b.num_columns()).unwrap_or(0);
@@ -204,7 +218,9 @@ impl ActionHandler for QueryHandler {
             // at large scale factors.
             drop(tables);
             #[cfg(target_os = "linux")]
-            unsafe { libc::malloc_trim(0); }
+            unsafe {
+                libc::malloc_trim(0);
+            }
 
             return Ok(result);
         }
@@ -309,10 +325,8 @@ async fn execute_distributed_aggregate(
     );
 
     let merge_config = build_final_merge_config(group_by.len(), &worker_aggs)?;
-    let merged_worker_batch = prism_executor::hash_aggregate::hash_aggregate_batches(
-        &partial_batches,
-        &merge_config,
-    )?;
+    let merged_worker_batch =
+        prism_executor::hash_aggregate::hash_aggregate_batches(&partial_batches, &merge_config)?;
 
     tracing::info!(
         "distributed aggregate reducer {} merged {} partial batches into {} rows",
@@ -345,7 +359,9 @@ fn find_aggregate(node: &PlanNode) -> Option<(Vec<usize>, Vec<AggExpr>)> {
 
 fn replace_aggregates(node: &PlanNode, new_aggs: &[AggExpr]) -> anyhow::Result<PlanNode> {
     match node {
-        PlanNode::Aggregate { input, group_by, .. } => Ok(PlanNode::Aggregate {
+        PlanNode::Aggregate {
+            input, group_by, ..
+        } => Ok(PlanNode::Aggregate {
             input: input.clone(),
             group_by: group_by.clone(),
             aggregates: new_aggs.to_vec(),
@@ -460,9 +476,16 @@ fn reconstruct_original_aggregate_batch(
             AggFunc::Count | AggFunc::CountDistinct => {
                 let mut values = Vec::with_capacity(merged_worker_batch.num_rows());
                 for row in 0..merged_worker_batch.num_rows() {
-                    values.push(numeric_value_as_i64(merged_worker_batch.column(source_idx), row)?);
+                    values.push(numeric_value_as_i64(
+                        merged_worker_batch.column(source_idx),
+                        row,
+                    )?);
                 }
-                fields.push(Arc::new(Field::new(&agg.output_name, DataType::Int64, true)));
+                fields.push(Arc::new(Field::new(
+                    &agg.output_name,
+                    DataType::Int64,
+                    true,
+                )));
                 columns.push(Arc::new(Int64Array::from(values)));
             }
             AggFunc::Avg => {
@@ -473,15 +496,26 @@ fn reconstruct_original_aggregate_batch(
                     let count = numeric_value_as_f64(merged_worker_batch.column(count_idx), row)?;
                     values.push(if count > 0.0 { sum / count } else { 0.0 });
                 }
-                fields.push(Arc::new(Field::new(&agg.output_name, DataType::Float64, true)));
+                fields.push(Arc::new(Field::new(
+                    &agg.output_name,
+                    DataType::Float64,
+                    true,
+                )));
                 columns.push(Arc::new(Float64Array::from(values)));
             }
             AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
                 let mut values = Vec::with_capacity(merged_worker_batch.num_rows());
                 for row in 0..merged_worker_batch.num_rows() {
-                    values.push(numeric_value_as_f64(merged_worker_batch.column(source_idx), row)?);
+                    values.push(numeric_value_as_f64(
+                        merged_worker_batch.column(source_idx),
+                        row,
+                    )?);
                 }
-                fields.push(Arc::new(Field::new(&agg.output_name, DataType::Float64, true)));
+                fields.push(Arc::new(Field::new(
+                    &agg.output_name,
+                    DataType::Float64,
+                    true,
+                )));
                 columns.push(Arc::new(Float64Array::from(values)));
             }
         }
@@ -496,9 +530,15 @@ fn numeric_value_as_f64(array: &ArrayRef, row: usize) -> anyhow::Result<f64> {
         return Ok(0.0);
     }
     match array.data_type() {
-        DataType::Float64 => Ok(array.as_primitive::<arrow_array::types::Float64Type>().value(row)),
-        DataType::Int64 => Ok(array.as_primitive::<arrow_array::types::Int64Type>().value(row) as f64),
-        DataType::Int32 => Ok(array.as_primitive::<arrow_array::types::Int32Type>().value(row) as f64),
+        DataType::Float64 => Ok(array
+            .as_primitive::<arrow_array::types::Float64Type>()
+            .value(row)),
+        DataType::Int64 => Ok(array
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(row) as f64),
+        DataType::Int32 => Ok(array
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .value(row) as f64),
         other => Err(anyhow::anyhow!(
             "unsupported numeric type for distributed aggregate merge: {:?}",
             other
@@ -511,9 +551,15 @@ fn numeric_value_as_i64(array: &ArrayRef, row: usize) -> anyhow::Result<i64> {
         return Ok(0);
     }
     match array.data_type() {
-        DataType::Int64 => Ok(array.as_primitive::<arrow_array::types::Int64Type>().value(row)),
-        DataType::Int32 => Ok(array.as_primitive::<arrow_array::types::Int32Type>().value(row) as i64),
-        DataType::Float64 => Ok(array.as_primitive::<arrow_array::types::Float64Type>().value(row) as i64),
+        DataType::Int64 => Ok(array
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(row)),
+        DataType::Int32 => Ok(array
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .value(row) as i64),
+        DataType::Float64 => Ok(array
+            .as_primitive::<arrow_array::types::Float64Type>()
+            .value(row) as i64),
         other => Err(anyhow::anyhow!(
             "unsupported integer type for distributed aggregate merge: {:?}",
             other
@@ -521,11 +567,7 @@ fn numeric_value_as_i64(array: &ArrayRef, row: usize) -> anyhow::Result<i64> {
     }
 }
 
-async fn send_partial_batch(
-    endpoint: &str,
-    key: &str,
-    batch: RecordBatch,
-) -> anyhow::Result<()> {
+async fn send_partial_batch(endpoint: &str, key: &str, batch: RecordBatch) -> anyhow::Result<()> {
     let attempts = 3;
     let batch_rows = batch.num_rows();
     let batch_bytes: usize = batch
@@ -709,7 +751,12 @@ impl QueryHandler {
             "orders" => {
                 datagen::write_orders_parquet(&output_dir, row_count, row_offset, row_group_size)?
             }
-            other => return Err(anyhow::anyhow!("datagen_parquet: unknown table '{}'", other)),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "datagen_parquet: unknown table '{}'",
+                    other
+                ))
+            }
         };
         let elapsed = start.elapsed();
 
@@ -731,7 +778,9 @@ impl QueryHandler {
             vec![
                 Arc::new(StringArray::from(vec![table])),
                 Arc::new(Int64Array::from(vec![row_count as i64])),
-                Arc::new(StringArray::from(vec![file_path.to_string_lossy().to_string()])),
+                Arc::new(StringArray::from(vec![file_path
+                    .to_string_lossy()
+                    .to_string()])),
             ],
         )?)
     }
@@ -825,7 +874,10 @@ async fn load_tables_smart(
     store: &PartitionStore,
     data_dir: Option<&Path>,
     hints: &HashMap<String, ScanHint>,
-) -> anyhow::Result<(HashMap<String, Vec<RecordBatch>>, HashMap<String, HashMap<usize, usize>>)> {
+) -> anyhow::Result<(
+    HashMap<String, Vec<RecordBatch>>,
+    HashMap<String, HashMap<usize, usize>>,
+)> {
     let tables_map = command["tables"]
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("missing 'tables' field"))?;
@@ -936,7 +988,11 @@ fn remap_plan_rec(
     use prism_substrait::plan::PlanNode;
 
     match node {
-        PlanNode::Scan { table_name, projection, .. } => {
+        PlanNode::Scan {
+            table_name,
+            projection,
+            ..
+        } => {
             if let Some(remap) = table_remaps.get(table_name) {
                 if let Some(proj) = projection {
                     for idx in proj.iter_mut() {
@@ -955,7 +1011,11 @@ fn remap_plan_rec(
             remap_predicate_local(predicate, &input_remap);
             input_remap
         }
-        PlanNode::Project { input, columns, expressions } => {
+        PlanNode::Project {
+            input,
+            columns,
+            expressions,
+        } => {
             let input_remap = remap_plan_rec(input, table_remaps);
 
             // Remap expression column refs using input_remap.
@@ -999,7 +1059,11 @@ fn remap_plan_rec(
 
             output_remap
         }
-        PlanNode::Aggregate { input, group_by, aggregates } => {
+        PlanNode::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
             let input_remap = remap_plan_rec(input, table_remaps);
             for idx in group_by.iter_mut() {
                 if let Some(&new_idx) = input_remap.get(idx) {
@@ -1014,7 +1078,13 @@ fn remap_plan_rec(
             let n = group_by.len() + aggregates.len();
             (0..n).map(|i| (i, i)).collect()
         }
-        PlanNode::Join { left, right, left_keys, right_keys, .. } => {
+        PlanNode::Join {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            ..
+        } => {
             let left_full_cols = find_scan_full_cols(left);
             let left_remap = remap_plan_rec(left, table_remaps);
             let right_remap = remap_plan_rec(right, table_remaps);
@@ -1047,7 +1117,9 @@ fn remap_plan_rec(
             }
             combined
         }
-        PlanNode::Sort { input, sort_keys, .. } => {
+        PlanNode::Sort {
+            input, sort_keys, ..
+        } => {
             let input_remap = remap_plan_rec(input, table_remaps);
             for key in sort_keys.iter_mut() {
                 if let Some(&new_idx) = input_remap.get(&key.column) {
@@ -1056,7 +1128,11 @@ fn remap_plan_rec(
             }
             input_remap
         }
-        PlanNode::Exchange { input, partition_keys, .. } => {
+        PlanNode::Exchange {
+            input,
+            partition_keys,
+            ..
+        } => {
             let input_remap = remap_plan_rec(input, table_remaps);
             for idx in partition_keys.iter_mut() {
                 if let Some(&new_idx) = input_remap.get(idx) {
@@ -1089,14 +1165,21 @@ fn remap_predicate_local(
 ) {
     use prism_executor::filter_project::Predicate::*;
     match pred {
+        Literal(_) => {}
         Eq(c, _) | Ne(c, _) | Lt(c, _) | Le(c, _) | Gt(c, _) | Ge(c, _) => {
-            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+            if let Some(&new_idx) = col_map.get(c) {
+                *c = new_idx;
+            }
         }
         IsNull(c) | IsNotNull(c) => {
-            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+            if let Some(&new_idx) = col_map.get(c) {
+                *c = new_idx;
+            }
         }
         Like(c, _) | ILike(c, _) => {
-            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+            if let Some(&new_idx) = col_map.get(c) {
+                *c = new_idx;
+            }
         }
         And(l, r) | Or(l, r) => {
             remap_predicate_local(l, col_map);
@@ -1115,7 +1198,9 @@ fn remap_expr_local(
     use prism_executor::filter_project::ScalarExpr::*;
     match expr {
         ColumnRef(c) => {
-            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+            if let Some(&new_idx) = col_map.get(c) {
+                *c = new_idx;
+            }
         }
         Literal(_) => {}
         BinaryOp { left, right, .. } => {
@@ -1124,6 +1209,15 @@ fn remap_expr_local(
         }
         Negate(inner) => {
             remap_expr_local(inner, col_map);
+        }
+        IfThen { clauses, else_expr } => {
+            for (predicate, then_expr) in clauses.iter_mut() {
+                remap_predicate_local(predicate, col_map);
+                remap_expr_local(then_expr, col_map);
+            }
+            if let Some(otherwise) = else_expr {
+                remap_expr_local(otherwise, col_map);
+            }
         }
     }
 }
@@ -1169,8 +1263,8 @@ async fn load_tables(
 mod tests {
     use super::*;
     use arrow_array::{Float64Array, Int64Array, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
     use arrow_flight::flight_service_server::FlightServiceServer;
+    use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
@@ -1212,8 +1306,9 @@ mod tests {
         });
 
         let hints: HashMap<String, ScanHint> = HashMap::new();
-        let (tables, remaps) =
-            load_tables_smart(&command, &store, None, &hints).await.unwrap();
+        let (tables, remaps) = load_tables_smart(&command, &store, None, &hints)
+            .await
+            .unwrap();
         assert_eq!(tables.len(), 1);
         assert!(remaps.is_empty());
         let batches = tables.get("x").unwrap();
@@ -1252,7 +1347,9 @@ mod tests {
         });
 
         let hints: HashMap<String, ScanHint> = HashMap::new();
-        let (tables, _remaps) = load_tables_smart(&command, &store, None, &hints).await.unwrap();
+        let (tables, _remaps) = load_tables_smart(&command, &store, None, &hints)
+            .await
+            .unwrap();
 
         let batches = tables.get("x").unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1335,18 +1432,19 @@ mod tests {
             &merge_config,
         )
         .unwrap();
-        let final_batch = reconstruct_original_aggregate_batch(
-            &merged,
-            1,
-            &original_aggs,
-            &agg_mapping,
-        )
-        .unwrap();
+        let final_batch =
+            reconstruct_original_aggregate_batch(&merged, 1, &original_aggs, &agg_mapping).unwrap();
 
         let statuses = final_batch.column(0).as_string::<i32>();
-        let sum = final_batch.column(1).as_primitive::<arrow_array::types::Float64Type>();
-        let count = final_batch.column(2).as_primitive::<arrow_array::types::Int64Type>();
-        let avg = final_batch.column(3).as_primitive::<arrow_array::types::Float64Type>();
+        let sum = final_batch
+            .column(1)
+            .as_primitive::<arrow_array::types::Float64Type>();
+        let count = final_batch
+            .column(2)
+            .as_primitive::<arrow_array::types::Int64Type>();
+        let avg = final_batch
+            .column(3)
+            .as_primitive::<arrow_array::types::Float64Type>();
 
         let mut rows = StdHashMap::new();
         for row in 0..final_batch.num_rows() {

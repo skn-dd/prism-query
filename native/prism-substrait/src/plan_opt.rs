@@ -147,8 +147,16 @@ fn output_col_count(node: &PlanNode) -> usize {
         PlanNode::Filter { input, .. }
         | PlanNode::Sort { input, .. }
         | PlanNode::Exchange { input, .. } => output_col_count(input),
-        PlanNode::Project { columns, expressions, .. } => columns.len() + expressions.len(),
-        PlanNode::Aggregate { group_by, aggregates, .. } => group_by.len() + aggregates.len(),
+        PlanNode::Project {
+            columns,
+            expressions,
+            ..
+        } => columns.len() + expressions.len(),
+        PlanNode::Aggregate {
+            group_by,
+            aggregates,
+            ..
+        } => group_by.len() + aggregates.len(),
         PlanNode::Join { left, right, .. } => output_col_count(left) + output_col_count(right),
     }
 }
@@ -173,7 +181,11 @@ fn push_columns_down(
             combined.extend(pred_cols);
             push_columns_down(input, &combined, out);
         }
-        PlanNode::Project { input, columns, expressions } => {
+        PlanNode::Project {
+            input,
+            columns,
+            expressions,
+        } => {
             // Project output: [columns...; expression results...]
             // Map needed output indices back to input col references.
             let mut input_needed: HashSet<usize> = HashSet::new();
@@ -190,7 +202,11 @@ fn push_columns_down(
             }
             push_columns_down(input, &input_needed, out);
         }
-        PlanNode::Aggregate { input, group_by, aggregates } => {
+        PlanNode::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
             // Aggregate input cols = group_by cols + aggregate input cols.
             let mut input_needed: HashSet<usize> = HashSet::new();
             for &c in group_by {
@@ -201,7 +217,13 @@ fn push_columns_down(
             }
             push_columns_down(input, &input_needed, out);
         }
-        PlanNode::Join { left, right, left_keys, right_keys, .. } => {
+        PlanNode::Join {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            ..
+        } => {
             let left_cols = output_col_count(left);
             let mut left_needed: HashSet<usize> = HashSet::new();
             let mut right_needed: HashSet<usize> = HashSet::new();
@@ -221,14 +243,20 @@ fn push_columns_down(
             push_columns_down(left, &left_needed, out);
             push_columns_down(right, &right_needed, out);
         }
-        PlanNode::Sort { input, sort_keys, .. } => {
+        PlanNode::Sort {
+            input, sort_keys, ..
+        } => {
             let mut combined = needed.clone();
             for sk in sort_keys {
                 combined.insert(sk.column);
             }
             push_columns_down(input, &combined, out);
         }
-        PlanNode::Exchange { input, partition_keys, .. } => {
+        PlanNode::Exchange {
+            input,
+            partition_keys,
+            ..
+        } => {
             let mut combined = needed.clone();
             for &k in partition_keys {
                 combined.insert(k);
@@ -328,11 +356,7 @@ fn collect_referenced_columns(node: &PlanNode, cols: &mut HashMap<String, HashSe
             collect_referenced_columns(input, cols);
         }
 
-        PlanNode::Join {
-            left,
-            right,
-            ..
-        } => {
+        PlanNode::Join { left, right, .. } => {
             // If a join subtree has column-limiting nodes (Project, Filter, Aggregate),
             // let the recursion determine needed columns from those nodes.
             // Otherwise, fall back to loading all columns (usize::MAX sentinel).
@@ -386,6 +410,7 @@ fn find_scan_table(node: &PlanNode) -> Option<String> {
 fn collect_predicate_columns(pred: &Predicate, cols: &mut HashSet<usize>) {
     use Predicate::*;
     match pred {
+        Literal(_) => {}
         Eq(c, _) | Ne(c, _) | Lt(c, _) | Le(c, _) | Gt(c, _) | Ge(c, _) => {
             cols.insert(*c);
         }
@@ -415,7 +440,12 @@ fn collect_predicate_columns(pred: &Predicate, cols: &mut HashSet<usize>) {
 pub fn detect_count_star(node: &PlanNode) -> Option<(String, Option<Predicate>)> {
     use prism_executor::hash_aggregate::AggFunc;
 
-    if let PlanNode::Aggregate { input, group_by, aggregates } = node {
+    if let PlanNode::Aggregate {
+        input,
+        group_by,
+        aggregates,
+    } = node
+    {
         // Must be a global aggregate (no GROUP BY)
         if !group_by.is_empty() {
             return None;
@@ -430,7 +460,10 @@ pub fn detect_count_star(node: &PlanNode) -> Option<(String, Option<Predicate>)>
             PlanNode::Scan { table_name, .. } => {
                 return Some((table_name.clone(), None));
             }
-            PlanNode::Filter { input: filter_inner, predicate } => {
+            PlanNode::Filter {
+                input: filter_inner,
+                predicate,
+            } => {
                 let scan_node = skip_projects(filter_inner.as_ref());
                 if let PlanNode::Scan { table_name, .. } = scan_node {
                     return Some((table_name.clone(), Some(predicate.clone())));
@@ -467,6 +500,15 @@ fn collect_expr_columns(
         }
         Negate(inner) => {
             collect_expr_columns(inner, cols);
+        }
+        IfThen { clauses, else_expr } => {
+            for (predicate, then_expr) in clauses {
+                collect_predicate_columns(predicate, cols);
+                collect_expr_columns(then_expr, cols);
+            }
+            if let Some(otherwise) = else_expr {
+                collect_expr_columns(otherwise, cols);
+            }
         }
     }
 }

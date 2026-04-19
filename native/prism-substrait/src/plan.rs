@@ -90,7 +90,11 @@ impl PlanNode {
                 remap_predicate(predicate, col_map);
                 input.remap_columns(col_map);
             }
-            PlanNode::Project { input, columns, expressions } => {
+            PlanNode::Project {
+                input,
+                columns,
+                expressions,
+            } => {
                 for idx in columns.iter_mut() {
                     if let Some(&new_idx) = col_map.get(idx) {
                         *idx = new_idx;
@@ -101,7 +105,11 @@ impl PlanNode {
                 }
                 input.remap_columns(col_map);
             }
-            PlanNode::Aggregate { input, group_by, aggregates } => {
+            PlanNode::Aggregate {
+                input,
+                group_by,
+                aggregates,
+            } => {
                 for idx in group_by.iter_mut() {
                     if let Some(&new_idx) = col_map.get(idx) {
                         *idx = new_idx;
@@ -114,7 +122,13 @@ impl PlanNode {
                 }
                 input.remap_columns(col_map);
             }
-            PlanNode::Join { left, right, left_keys, right_keys, .. } => {
+            PlanNode::Join {
+                left,
+                right,
+                left_keys,
+                right_keys,
+                ..
+            } => {
                 for idx in left_keys.iter_mut() {
                     if let Some(&new_idx) = col_map.get(idx) {
                         *idx = new_idx;
@@ -128,7 +142,9 @@ impl PlanNode {
                 left.remap_columns(col_map);
                 right.remap_columns(col_map);
             }
-            PlanNode::Sort { input, sort_keys, .. } => {
+            PlanNode::Sort {
+                input, sort_keys, ..
+            } => {
                 for key in sort_keys.iter_mut() {
                     if let Some(&new_idx) = col_map.get(&key.column) {
                         key.column = new_idx;
@@ -136,7 +152,11 @@ impl PlanNode {
                 }
                 input.remap_columns(col_map);
             }
-            PlanNode::Exchange { input, partition_keys, .. } => {
+            PlanNode::Exchange {
+                input,
+                partition_keys,
+                ..
+            } => {
                 for idx in partition_keys.iter_mut() {
                     if let Some(&new_idx) = col_map.get(idx) {
                         *idx = new_idx;
@@ -151,14 +171,21 @@ impl PlanNode {
 fn remap_predicate(pred: &mut Predicate, col_map: &std::collections::HashMap<usize, usize>) {
     use Predicate::*;
     match pred {
+        Literal(_) => {}
         Eq(c, _) | Ne(c, _) | Lt(c, _) | Le(c, _) | Gt(c, _) | Ge(c, _) => {
-            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+            if let Some(&new_idx) = col_map.get(c) {
+                *c = new_idx;
+            }
         }
         IsNull(c) | IsNotNull(c) => {
-            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+            if let Some(&new_idx) = col_map.get(c) {
+                *c = new_idx;
+            }
         }
         Like(c, _) | ILike(c, _) => {
-            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+            if let Some(&new_idx) = col_map.get(c) {
+                *c = new_idx;
+            }
         }
         And(l, r) | Or(l, r) => {
             remap_predicate(l, col_map);
@@ -174,7 +201,9 @@ fn remap_expr(expr: &mut ScalarExpr, col_map: &std::collections::HashMap<usize, 
     use ScalarExpr::*;
     match expr {
         ColumnRef(c) => {
-            if let Some(&new_idx) = col_map.get(c) { *c = new_idx; }
+            if let Some(&new_idx) = col_map.get(c) {
+                *c = new_idx;
+            }
         }
         Literal(_) => {}
         BinaryOp { left, right, .. } => {
@@ -183,6 +212,15 @@ fn remap_expr(expr: &mut ScalarExpr, col_map: &std::collections::HashMap<usize, 
         }
         Negate(inner) => {
             remap_expr(inner, col_map);
+        }
+        IfThen { clauses, else_expr } => {
+            for (predicate, then_expr) in clauses.iter_mut() {
+                remap_predicate(predicate, col_map);
+                remap_expr(then_expr, col_map);
+            }
+            if let Some(otherwise) = else_expr {
+                remap_expr(otherwise, col_map);
+            }
         }
     }
 }

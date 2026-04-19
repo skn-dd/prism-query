@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::compute::concat_batches;
 use arrow::compute;
+use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema, SchemaRef};
 use rayon::prelude::*;
@@ -40,10 +40,7 @@ fn mem_rss_mb() -> u64 {
 }
 
 /// Execute a PlanNode tree against a table registry (single RecordBatch per table).
-pub fn execute_plan(
-    node: &PlanNode,
-    tables: &HashMap<String, RecordBatch>,
-) -> Result<RecordBatch> {
+pub fn execute_plan(node: &PlanNode, tables: &HashMap<String, RecordBatch>) -> Result<RecordBatch> {
     let chunked: HashMap<String, Vec<RecordBatch>> = tables
         .iter()
         .map(|(k, v)| (k.clone(), vec![v.clone()]))
@@ -72,7 +69,11 @@ fn execute_node(
     tables: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<Vec<RecordBatch>> {
     match node {
-        PlanNode::Scan { table_name, projection, .. } => {
+        PlanNode::Scan {
+            table_name,
+            projection,
+            ..
+        } => {
             let batches = tables.get(table_name).ok_or_else(|| {
                 SubstraitError::Internal(format!("table '{}' not found in registry", table_name))
             })?;
@@ -91,20 +92,27 @@ fn execute_node(
             let child_batches = execute_node(input, tables)?;
 
             // Parallel filter: process batches concurrently with rayon
-            let results: Vec<std::result::Result<Option<RecordBatch>, SubstraitError>> = child_batches
-                .par_iter()
-                .map(|batch| -> std::result::Result<Option<RecordBatch>, SubstraitError> {
-                    let mask = filter_project::evaluate_predicate(batch, predicate)
-                        .map_err(|e| SubstraitError::Internal(format!("filter error: {}", e)))?;
-                    let filtered = filter_project::filter_batch(batch, &mask)
-                        .map_err(|e| SubstraitError::Internal(format!("filter error: {}", e)))?;
-                    if filtered.num_rows() > 0 {
-                        Ok(Some(filtered))
-                    } else {
-                        Ok(None)
-                    }
-                })
-                .collect();
+            let results: Vec<std::result::Result<Option<RecordBatch>, SubstraitError>> =
+                child_batches
+                    .par_iter()
+                    .map(
+                        |batch| -> std::result::Result<Option<RecordBatch>, SubstraitError> {
+                            let mask = filter_project::evaluate_predicate(batch, predicate)
+                                .map_err(|e| {
+                                    SubstraitError::Internal(format!("filter error: {}", e))
+                                })?;
+                            let filtered =
+                                filter_project::filter_batch(batch, &mask).map_err(|e| {
+                                    SubstraitError::Internal(format!("filter error: {}", e))
+                                })?;
+                            if filtered.num_rows() > 0 {
+                                Ok(Some(filtered))
+                            } else {
+                                Ok(None)
+                            }
+                        },
+                    )
+                    .collect();
 
             let mut output = Vec::new();
             for result in results {
@@ -115,23 +123,36 @@ fn execute_node(
             Ok(output)
         }
 
-        PlanNode::Project { input, columns, expressions } => {
+        PlanNode::Project {
+            input,
+            columns,
+            expressions,
+        } => {
             tracing::info!("MEM pre-project-input: {} MB", mem_rss_mb());
             let child_batches = execute_node(input, tables)?;
-            tracing::info!("MEM post-project-input ({} batches): {} MB", child_batches.len(), mem_rss_mb());
+            tracing::info!(
+                "MEM post-project-input ({} batches): {} MB",
+                child_batches.len(),
+                mem_rss_mb()
+            );
 
             // Parallel project
             let results: Vec<std::result::Result<RecordBatch, SubstraitError>> = child_batches
                 .par_iter()
-                .map(|batch| -> std::result::Result<RecordBatch, SubstraitError> {
-                    if expressions.is_empty() {
-                        filter_project::project_batch(batch, columns)
-                            .map_err(|e| SubstraitError::Internal(format!("project error: {}", e)))
-                    } else {
-                        filter_project::project_batch_with_exprs(batch, columns, expressions)
-                            .map_err(|e| SubstraitError::Internal(format!("project error: {}", e)))
-                    }
-                })
+                .map(
+                    |batch| -> std::result::Result<RecordBatch, SubstraitError> {
+                        if expressions.is_empty() {
+                            filter_project::project_batch(batch, columns).map_err(|e| {
+                                SubstraitError::Internal(format!("project error: {}", e))
+                            })
+                        } else {
+                            filter_project::project_batch_with_exprs(batch, columns, expressions)
+                                .map_err(|e| {
+                                    SubstraitError::Internal(format!("project error: {}", e))
+                                })
+                        }
+                    },
+                )
                 .collect();
 
             let mut output = Vec::new();
@@ -146,7 +167,9 @@ fn execute_node(
             group_by,
             aggregates,
         } => {
-            if let Some(result) = try_execute_fused_join_aggregate(input, group_by, aggregates, tables)? {
+            if let Some(result) =
+                try_execute_fused_join_aggregate(input, group_by, aggregates, tables)?
+            {
                 return Ok(vec![result]);
             }
 
@@ -172,9 +195,17 @@ fn execute_node(
         } => {
             tracing::info!("MEM pre-left-exec: {} MB", mem_rss_mb());
             let left_batches = execute_node(left, tables)?;
-            tracing::info!("MEM post-left-exec ({} batches): {} MB", left_batches.len(), mem_rss_mb());
+            tracing::info!(
+                "MEM post-left-exec ({} batches): {} MB",
+                left_batches.len(),
+                mem_rss_mb()
+            );
             let right_batches = execute_node(right, tables)?;
-            tracing::info!("MEM post-right-exec ({} batches): {} MB", right_batches.len(), mem_rss_mb());
+            tracing::info!(
+                "MEM post-right-exec ({} batches): {} MB",
+                right_batches.len(),
+                mem_rss_mb()
+            );
 
             if left_batches.is_empty() || right_batches.is_empty() {
                 return Ok(vec![]);
@@ -194,20 +225,22 @@ fn execute_node(
                 | hash_join::JoinType::Left
                 | hash_join::JoinType::LeftSemi
                 | hash_join::JoinType::LeftAnti => {
-                    let right_merged =
-                        concat_batches(&right_batches[0].schema(), &right_batches)?;
+                    let right_merged = concat_batches(&right_batches[0].schema(), &right_batches)?;
                     drop(right_batches);
                     tracing::info!("MEM post-right-merge: {} MB", mem_rss_mb());
-                    let out = hash_join::hash_join_probe_chunked(&left_batches, &right_merged, &config)?;
-                    tracing::info!("MEM post-probe ({} batches): {} MB", out.len(), mem_rss_mb());
+                    let out =
+                        hash_join::hash_join_probe_chunked(&left_batches, &right_merged, &config)?;
+                    tracing::info!(
+                        "MEM post-probe ({} batches): {} MB",
+                        out.len(),
+                        mem_rss_mb()
+                    );
                     Ok(out)
                 }
                 _ => {
                     // Right/Full joins: fall back to single-batch path
-                    let left_merged =
-                        concat_batches(&left_batches[0].schema(), &left_batches)?;
-                    let right_merged =
-                        concat_batches(&right_batches[0].schema(), &right_batches)?;
+                    let left_merged = concat_batches(&left_batches[0].schema(), &left_batches)?;
+                    let right_merged = concat_batches(&right_batches[0].schema(), &right_batches)?;
                     let result = hash_join::hash_join(&left_merged, &right_merged, &config)?;
                     Ok(vec![result])
                 }
@@ -235,8 +268,9 @@ fn execute_node(
                         let t_heap = std::time::Instant::now();
                         tracing::info!(
                             "TOPN_HEAP: rows={} nbatches={} took={:.1}ms",
-                            total_rows, child_batches.len(),
-                            t_heap.duration_since(t0).as_secs_f64()*1000.0,
+                            total_rows,
+                            child_batches.len(),
+                            t_heap.duration_since(t0).as_secs_f64() * 1000.0,
                         );
                         return Ok(vec![result]);
                     }
@@ -244,16 +278,17 @@ fn execute_node(
                 // Streaming top-N: sort each batch with limit in parallel,
                 // then merge-sort the partial results. This avoids concatenating
                 // all 150M+ rows just to keep the top N.
-                let partial_results: Vec<std::result::Result<RecordBatch, SubstraitError>> = child_batches
-                    .par_iter()
-                    .map(|batch| {
-                        if batch.num_rows() == 0 {
-                            return Ok(batch.clone());
-                        }
-                        sort::sort_batch_limit(batch, sort_keys, *lim)
-                            .map_err(|e| SubstraitError::Internal(format!("sort error: {}", e)))
-                    })
-                    .collect();
+                let partial_results: Vec<std::result::Result<RecordBatch, SubstraitError>> =
+                    child_batches
+                        .par_iter()
+                        .map(|batch| {
+                            if batch.num_rows() == 0 {
+                                return Ok(batch.clone());
+                            }
+                            sort::sort_batch_limit(batch, sort_keys, *lim)
+                                .map_err(|e| SubstraitError::Internal(format!("sort error: {}", e)))
+                        })
+                        .collect();
                 let t1 = std::time::Instant::now();
 
                 let mut sorted_partials: Vec<RecordBatch> = Vec::new();
@@ -291,9 +326,7 @@ fn execute_node(
             }
         }
 
-        PlanNode::Exchange { input, .. } => {
-            execute_node(input, tables)
-        }
+        PlanNode::Exchange { input, .. } => execute_node(input, tables),
     }
 }
 
@@ -354,7 +387,8 @@ fn try_execute_fused_join_aggregate(
         join_type,
         left_keys,
         right_keys,
-    } = join else {
+    } = join
+    else {
         return Ok(None);
     };
 
@@ -468,13 +502,9 @@ fn project_join_matches(
             .collect();
         let temp_columns = referenced
             .iter()
-            .map(|idx| take_join_column(
-                probe_batch,
-                probe_indices,
-                build_batch,
-                build_indices,
-                *idx,
-            ))
+            .map(|idx| {
+                take_join_column(probe_batch, probe_indices, build_batch, build_indices, *idx)
+            })
             .collect::<Result<Vec<_>>>()?;
         let temp_schema = SchemaRef::new(Schema::new(temp_fields));
         let temp_batch = RecordBatch::try_new(temp_schema, temp_columns)?;
@@ -506,7 +536,11 @@ fn take_join_column(
     column: usize,
 ) -> Result<arrow_array::ArrayRef> {
     if column < probe_batch.num_columns() {
-        Ok(compute::take(probe_batch.column(column), probe_indices, None)?)
+        Ok(compute::take(
+            probe_batch.column(column),
+            probe_indices,
+            None,
+        )?)
     } else {
         Ok(compute::take(
             build_batch.column(column - probe_batch.num_columns()),
@@ -554,6 +588,44 @@ fn collect_expr_columns(
             collect_expr_columns(right, cols);
         }
         filter_project::ScalarExpr::Negate(inner) => collect_expr_columns(inner, cols),
+        filter_project::ScalarExpr::IfThen { clauses, else_expr } => {
+            for (predicate, then_expr) in clauses {
+                collect_predicate_columns(predicate, cols);
+                collect_expr_columns(then_expr, cols);
+            }
+            if let Some(otherwise) = else_expr {
+                collect_expr_columns(otherwise, cols);
+            }
+        }
+    }
+}
+
+fn collect_predicate_columns(
+    predicate: &filter_project::Predicate,
+    cols: &mut std::collections::BTreeSet<usize>,
+) {
+    use filter_project::Predicate;
+    match predicate {
+        Predicate::Literal(_) => {}
+        Predicate::Eq(c, _)
+        | Predicate::Ne(c, _)
+        | Predicate::Lt(c, _)
+        | Predicate::Le(c, _)
+        | Predicate::Gt(c, _)
+        | Predicate::Ge(c, _) => {
+            cols.insert(*c);
+        }
+        Predicate::IsNull(c)
+        | Predicate::IsNotNull(c)
+        | Predicate::Like(c, _)
+        | Predicate::ILike(c, _) => {
+            cols.insert(*c);
+        }
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            collect_predicate_columns(left, cols);
+            collect_predicate_columns(right, cols);
+        }
+        Predicate::Not(inner) => collect_predicate_columns(inner, cols),
     }
 }
 
@@ -579,6 +651,59 @@ fn remap_expr(
         filter_project::ScalarExpr::Negate(inner) => {
             filter_project::ScalarExpr::Negate(Box::new(remap_expr(inner, referenced)))
         }
+        filter_project::ScalarExpr::IfThen { clauses, else_expr } => {
+            filter_project::ScalarExpr::IfThen {
+                clauses: clauses
+                    .iter()
+                    .map(|(predicate, then_expr)| {
+                        (
+                            remap_predicate(predicate, referenced),
+                            remap_expr(then_expr, referenced),
+                        )
+                    })
+                    .collect(),
+                else_expr: else_expr
+                    .as_ref()
+                    .map(|otherwise| Box::new(remap_expr(otherwise, referenced))),
+            }
+        }
+    }
+}
+
+fn remap_predicate(
+    predicate: &filter_project::Predicate,
+    referenced: &[usize],
+) -> filter_project::Predicate {
+    use filter_project::Predicate;
+
+    let remap_col = |idx: usize| {
+        referenced
+            .iter()
+            .position(|col| *col == idx)
+            .expect("referenced join column missing from predicate remap")
+    };
+
+    match predicate {
+        Predicate::Literal(value) => Predicate::Literal(*value),
+        Predicate::Eq(c, v) => Predicate::Eq(remap_col(*c), v.clone()),
+        Predicate::Ne(c, v) => Predicate::Ne(remap_col(*c), v.clone()),
+        Predicate::Lt(c, v) => Predicate::Lt(remap_col(*c), v.clone()),
+        Predicate::Le(c, v) => Predicate::Le(remap_col(*c), v.clone()),
+        Predicate::Gt(c, v) => Predicate::Gt(remap_col(*c), v.clone()),
+        Predicate::Ge(c, v) => Predicate::Ge(remap_col(*c), v.clone()),
+        Predicate::IsNull(c) => Predicate::IsNull(remap_col(*c)),
+        Predicate::IsNotNull(c) => Predicate::IsNotNull(remap_col(*c)),
+        Predicate::Like(c, pattern) => Predicate::Like(remap_col(*c), pattern.clone()),
+        Predicate::ILike(c, pattern) => Predicate::ILike(remap_col(*c), pattern.clone()),
+        Predicate::And(left, right) => Predicate::And(
+            Box::new(remap_predicate(left, referenced)),
+            Box::new(remap_predicate(right, referenced)),
+        ),
+        Predicate::Or(left, right) => Predicate::Or(
+            Box::new(remap_predicate(left, referenced)),
+            Box::new(remap_predicate(right, referenced)),
+        ),
+        Predicate::Not(inner) => Predicate::Not(Box::new(remap_predicate(inner, referenced))),
     }
 }
 
@@ -669,19 +794,29 @@ fn reconstruct_original_aggregate_batch(
                 let values = (0..merged_worker_batch.num_rows())
                     .map(|row| numeric_value_as_i64(merged_worker_batch.column(source_idx), row))
                     .collect::<Result<Vec<_>>>()?;
-                fields.push(Arc::new(Field::new(&agg.output_name, arrow_schema::DataType::Int64, true)));
+                fields.push(Arc::new(Field::new(
+                    &agg.output_name,
+                    arrow_schema::DataType::Int64,
+                    true,
+                )));
                 columns.push(Arc::new(arrow_array::Int64Array::from(values)) as _);
             }
             hash_aggregate::AggFunc::Avg => {
                 let count_idx = group_by_count + agg_mapping[agg_idx][1];
                 let values = (0..merged_worker_batch.num_rows())
                     .map(|row| {
-                        let sum = numeric_value_as_f64(merged_worker_batch.column(source_idx), row)?;
-                        let count = numeric_value_as_f64(merged_worker_batch.column(count_idx), row)?;
+                        let sum =
+                            numeric_value_as_f64(merged_worker_batch.column(source_idx), row)?;
+                        let count =
+                            numeric_value_as_f64(merged_worker_batch.column(count_idx), row)?;
                         Ok(if count > 0.0 { sum / count } else { 0.0 })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                fields.push(Arc::new(Field::new(&agg.output_name, arrow_schema::DataType::Float64, true)));
+                fields.push(Arc::new(Field::new(
+                    &agg.output_name,
+                    arrow_schema::DataType::Float64,
+                    true,
+                )));
                 columns.push(Arc::new(arrow_array::Float64Array::from(values)) as _);
             }
             hash_aggregate::AggFunc::Sum
@@ -690,13 +825,20 @@ fn reconstruct_original_aggregate_batch(
                 let values = (0..merged_worker_batch.num_rows())
                     .map(|row| numeric_value_as_f64(merged_worker_batch.column(source_idx), row))
                     .collect::<Result<Vec<_>>>()?;
-                fields.push(Arc::new(Field::new(&agg.output_name, arrow_schema::DataType::Float64, true)));
+                fields.push(Arc::new(Field::new(
+                    &agg.output_name,
+                    arrow_schema::DataType::Float64,
+                    true,
+                )));
                 columns.push(Arc::new(arrow_array::Float64Array::from(values)) as _);
             }
         }
     }
 
-    Ok(RecordBatch::try_new(SchemaRef::new(Schema::new(fields)), columns)?)
+    Ok(RecordBatch::try_new(
+        SchemaRef::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 fn numeric_value_as_f64(array: &arrow_array::ArrayRef, row: usize) -> Result<f64> {
@@ -707,9 +849,15 @@ fn numeric_value_as_f64(array: &arrow_array::ArrayRef, row: usize) -> Result<f64
         return Ok(0.0);
     }
     match array.data_type() {
-        DataType::Float64 => Ok(array.as_primitive::<arrow_array::types::Float64Type>().value(row)),
-        DataType::Int64 => Ok(array.as_primitive::<arrow_array::types::Int64Type>().value(row) as f64),
-        DataType::Int32 => Ok(array.as_primitive::<arrow_array::types::Int32Type>().value(row) as f64),
+        DataType::Float64 => Ok(array
+            .as_primitive::<arrow_array::types::Float64Type>()
+            .value(row)),
+        DataType::Int64 => Ok(array
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(row) as f64),
+        DataType::Int32 => Ok(array
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .value(row) as f64),
         other => Err(SubstraitError::Internal(format!(
             "unsupported numeric type for aggregate merge: {:?}",
             other
@@ -725,9 +873,15 @@ fn numeric_value_as_i64(array: &arrow_array::ArrayRef, row: usize) -> Result<i64
         return Ok(0);
     }
     match array.data_type() {
-        DataType::Int64 => Ok(array.as_primitive::<arrow_array::types::Int64Type>().value(row)),
-        DataType::Int32 => Ok(array.as_primitive::<arrow_array::types::Int32Type>().value(row) as i64),
-        DataType::Float64 => Ok(array.as_primitive::<arrow_array::types::Float64Type>().value(row) as i64),
+        DataType::Int64 => Ok(array
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(row)),
+        DataType::Int32 => Ok(array
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .value(row) as i64),
+        DataType::Float64 => Ok(array
+            .as_primitive::<arrow_array::types::Float64Type>()
+            .value(row) as i64),
         other => Err(SubstraitError::Internal(format!(
             "unsupported integer type for aggregate merge: {:?}",
             other
@@ -835,8 +989,12 @@ mod tests {
 
         let result = execute_plan_chunked(&plan, &tables).unwrap();
         let statuses = result.column(0).as_string::<i32>();
-        let revenue = result.column(1).as_primitive::<arrow_array::types::Float64Type>();
-        let counts = result.column(2).as_primitive::<arrow_array::types::Int64Type>();
+        let revenue = result
+            .column(1)
+            .as_primitive::<arrow_array::types::Float64Type>();
+        let counts = result
+            .column(2)
+            .as_primitive::<arrow_array::types::Int64Type>();
 
         let mut rows = HashMap::new();
         for row in 0..result.num_rows() {
@@ -908,7 +1066,9 @@ mod tests {
 
         let result = execute_plan_chunked(&plan, &tables).unwrap();
         let statuses = result.column(0).as_string::<i32>();
-        let avg = result.column(1).as_primitive::<arrow_array::types::Float64Type>();
+        let avg = result
+            .column(1)
+            .as_primitive::<arrow_array::types::Float64Type>();
 
         let mut rows = HashMap::new();
         for row in 0..result.num_rows() {

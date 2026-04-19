@@ -2982,6 +2982,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rayon",
+ "serde",
  "substrait",
  "thiserror 2.0.18",
  "tracing",

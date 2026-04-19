@@ -2,15 +2,18 @@ package io.prism.plugin;
 
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.security.ConnectorIdentity;
+import io.trino.spi.security.SelectedRole;
 import io.trino.spi.session.PropertyMetadata;
 import io.trino.spi.type.TimeZoneKey;
 
 import java.time.Instant;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Minimal ConnectorSession test double. Carries just the typed-property map used
@@ -19,9 +22,11 @@ import java.util.Optional;
  */
 final class TestSession implements ConnectorSession {
     private final Map<String, Object> properties;
+    private final ConnectorIdentity identity;
 
-    private TestSession(Map<String, Object> properties) {
+    private TestSession(Map<String, Object> properties, ConnectorIdentity identity) {
         this.properties = properties;
+        this.identity = identity;
     }
 
     /** Build a session seeded from the defaults declared by PrismSessionProperties. */
@@ -31,7 +36,7 @@ final class TestSession implements ConnectorSession {
         for (PropertyMetadata<?> p : props.getSessionProperties()) {
             m.put(p.getName(), p.getDefaultValue());
         }
-        return new TestSession(m);
+        return new TestSession(m, ConnectorIdentity.ofUser("test"));
     }
 
     /** Build a session seeded from an arbitrary session-property registry. */
@@ -40,13 +45,49 @@ final class TestSession implements ConnectorSession {
         for (PropertyMetadata<?> p : registry) {
             m.put(p.getName(), p.getDefaultValue());
         }
-        return new TestSession(m);
+        return new TestSession(m, ConnectorIdentity.ofUser("test"));
     }
 
     TestSession with(String name, Object value) {
         Map<String, Object> m = new HashMap<>(properties);
         m.put(name, value);
-        return new TestSession(m);
+        return new TestSession(m, identity);
+    }
+
+    TestSession withGroups(Set<String> groups) {
+        return new TestSession(properties, ConnectorIdentity.forUser(identity.getUser())
+                .withGroups(new LinkedHashSet<>(groups))
+                .withEnabledSystemRoles(identity.getEnabledSystemRoles())
+                .withConnectorRole(identity.getConnectorRole())
+                .withExtraCredentials(identity.getExtraCredentials())
+                .build());
+    }
+
+    TestSession withEnabledRoles(Set<String> roles) {
+        return new TestSession(properties, ConnectorIdentity.forUser(identity.getUser())
+                .withGroups(identity.getGroups())
+                .withEnabledSystemRoles(new LinkedHashSet<>(roles))
+                .withConnectorRole(identity.getConnectorRole())
+                .withExtraCredentials(identity.getExtraCredentials())
+                .build());
+    }
+
+    TestSession withConnectorRole(SelectedRole role) {
+        return new TestSession(properties, ConnectorIdentity.forUser(identity.getUser())
+                .withGroups(identity.getGroups())
+                .withEnabledSystemRoles(identity.getEnabledSystemRoles())
+                .withConnectorRole(role)
+                .withExtraCredentials(identity.getExtraCredentials())
+                .build());
+    }
+
+    TestSession withExtraCredentials(Map<String, String> extraCredentials) {
+        return new TestSession(properties, ConnectorIdentity.forUser(identity.getUser())
+                .withGroups(identity.getGroups())
+                .withEnabledSystemRoles(identity.getEnabledSystemRoles())
+                .withConnectorRole(identity.getConnectorRole())
+                .withExtraCredentials(new HashMap<>(extraCredentials))
+                .build());
     }
 
     @Override
@@ -57,7 +98,7 @@ final class TestSession implements ConnectorSession {
 
     @Override
     public ConnectorIdentity getIdentity() {
-        return ConnectorIdentity.ofUser("test");
+        return identity;
     }
 
     @Override

@@ -6,19 +6,22 @@
 use std::sync::Arc;
 
 use arrow::compute::{self, FilterBuilder};
-use arrow_array::{
-    cast::AsArray, Array, ArrayRef, BooleanArray, Datum, Float64Array, RecordBatch,
-};
 use arrow_array::types::{Float64Type, Int32Type, Int64Type};
+use arrow_array::{
+    cast::AsArray, new_null_array, Array, ArrayRef, BooleanArray, Datum, Float64Array, RecordBatch,
+};
 use arrow_cast::cast;
 use arrow_ord::cmp;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_select::zip::zip;
 
 use crate::{PrismError, Result};
 
 /// A predicate that can be evaluated against a RecordBatch.
 #[derive(Debug, Clone)]
 pub enum Predicate {
+    /// literal true/false broadcast across the batch
+    Literal(bool),
     /// column_index == literal
     Eq(usize, ScalarValue),
     /// column_index != literal
@@ -61,6 +64,7 @@ pub enum ScalarValue {
 /// Evaluate a predicate against a RecordBatch, producing a boolean selection mask.
 pub fn evaluate_predicate(batch: &RecordBatch, predicate: &Predicate) -> Result<BooleanArray> {
     match predicate {
+        Predicate::Literal(value) => Ok(BooleanArray::from(vec![*value; batch.num_rows()])),
         Predicate::Eq(col, val) => compare_column(batch, *col, val, CompareOp::Eq),
         Predicate::Ne(col, val) => compare_column(batch, *col, val, CompareOp::Ne),
         Predicate::Lt(col, val) => compare_column(batch, *col, val, CompareOp::Lt),
@@ -97,7 +101,8 @@ pub fn evaluate_predicate(batch: &RecordBatch, predicate: &Predicate) -> Result<
                     Ok(crate::string_ops::string_like(str_arr, pattern)?)
                 }
                 _ => Err(PrismError::InvalidArgument(format!(
-                    "LIKE requires Utf8 column, got {:?}", array.data_type()
+                    "LIKE requires Utf8 column, got {:?}",
+                    array.data_type()
                 ))),
             }
         }
@@ -109,7 +114,8 @@ pub fn evaluate_predicate(batch: &RecordBatch, predicate: &Predicate) -> Result<
                     Ok(crate::string_ops::string_ilike(str_arr, pattern)?)
                 }
                 _ => Err(PrismError::InvalidArgument(format!(
-                    "ILIKE requires Utf8 column, got {:?}", array.data_type()
+                    "ILIKE requires Utf8 column, got {:?}",
+                    array.data_type()
                 ))),
             }
         }
@@ -199,6 +205,11 @@ pub enum ScalarExpr {
     },
     /// Unary negation.
     Negate(Box<ScalarExpr>),
+    /// CASE / IF-THEN expression.
+    IfThen {
+        clauses: Vec<(Predicate, ScalarExpr)>,
+        else_expr: Option<Box<ScalarExpr>>,
+    },
 }
 
 /// Evaluate a scalar expression against a RecordBatch, returning a Float64 array.
@@ -212,9 +223,10 @@ pub fn evaluate_scalar_expr(batch: &RecordBatch, expr: &ScalarExpr) -> Result<Ar
                 ScalarValue::Int64(v) => Arc::new(arrow_array::Int64Array::from(vec![*v; len])),
                 ScalarValue::Int32(v) => Arc::new(arrow_array::Int32Array::from(vec![*v; len])),
                 ScalarValue::Date32(v) => Arc::new(arrow_array::Date32Array::from(vec![*v; len])),
-                _ => return Err(PrismError::InvalidArgument(
-                    format!("unsupported literal type in scalar expr: {:?}", val),
-                )),
+                ScalarValue::Utf8(v) => {
+                    Arc::new(arrow_array::StringArray::from(vec![v.as_str(); len]))
+                }
+                ScalarValue::Boolean(v) => Arc::new(BooleanArray::from(vec![*v; len])),
             };
             Ok(arr)
         }
@@ -241,6 +253,51 @@ pub fn evaluate_scalar_expr(batch: &RecordBatch, expr: &ScalarExpr) -> Result<Ar
             let negated: Float64Array = fa.iter().map(|v| v.map(|x| -x)).collect();
             Ok(Arc::new(negated))
         }
+        ScalarExpr::IfThen { clauses, else_expr } => {
+            if clauses.is_empty() {
+                return if let Some(otherwise) = else_expr {
+                    evaluate_scalar_expr(batch, otherwise)
+                } else {
+                    Err(PrismError::InvalidArgument(
+                        "IfThen expression requires at least one clause or an else branch".into(),
+                    ))
+                };
+            }
+
+            let mut branch_arrays = Vec::with_capacity(clauses.len());
+            for (_, then_expr) in clauses {
+                branch_arrays.push(evaluate_scalar_expr(batch, then_expr)?);
+            }
+            let mut result = if let Some(otherwise) = else_expr {
+                evaluate_scalar_expr(batch, otherwise)?
+            } else {
+                new_null_array(branch_arrays[0].data_type(), batch.num_rows())
+            };
+
+            let target_type = branch_arrays
+                .first()
+                .map(|arr| arr.data_type().clone())
+                .unwrap_or_else(|| result.data_type().clone());
+            result = cast_if_needed(&result, &target_type)?;
+
+            for (idx, (predicate, _)) in clauses.iter().enumerate().rev() {
+                let mask = evaluate_predicate(batch, predicate)?;
+                let branch = cast_if_needed(&branch_arrays[idx], &target_type)?;
+                let branch_datum = branch.as_ref();
+                let result_datum = result.as_ref();
+                result = zip(&mask, &branch_datum, &result_datum)?;
+            }
+
+            Ok(result)
+        }
+    }
+}
+
+fn cast_if_needed(array: &ArrayRef, target_type: &DataType) -> Result<ArrayRef> {
+    if array.data_type() == target_type {
+        Ok(array.clone())
+    } else {
+        Ok(cast(array, target_type)?)
     }
 }
 
@@ -334,11 +391,7 @@ fn compare_column(
     }
 }
 
-fn apply_cmp(
-    left: &dyn Datum,
-    right: &dyn Datum,
-    op: CompareOp,
-) -> Result<BooleanArray> {
+fn apply_cmp(left: &dyn Datum, right: &dyn Datum, op: CompareOp) -> Result<BooleanArray> {
     let result = match op {
         CompareOp::Eq => cmp::eq(left, right)?,
         CompareOp::Ne => cmp::neq(left, right)?,
@@ -353,7 +406,7 @@ fn apply_cmp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, Float64Array, StringArray};
+    use arrow_array::{Float64Array, Int64Array, StringArray};
     use arrow_schema::{Field, Schema};
     use std::sync::Arc;
 
@@ -368,11 +421,55 @@ mod tests {
             schema,
             vec![
                 Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
-                Arc::new(StringArray::from(vec!["alice", "bob", "carol", "dave", "eve"])),
+                Arc::new(StringArray::from(vec![
+                    "alice", "bob", "carol", "dave", "eve",
+                ])),
                 Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0, 40.0, 50.0])),
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn if_then_projects_string_branches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let projected = project_batch_with_exprs(
+            &batch,
+            &[0],
+            &[ScalarExpr::IfThen {
+                clauses: vec![(
+                    Predicate::Eq(0, ScalarValue::Int64(1)),
+                    ScalarExpr::Literal(ScalarValue::Utf8("owner".into())),
+                )],
+                else_expr: Some(Box::new(ScalarExpr::ColumnRef(1))),
+            }],
+        )
+        .unwrap();
+
+        let expr = projected.column(1).as_string::<i32>();
+        assert_eq!(expr.value(0), "owner");
+        assert_eq!(expr.value(1), "b");
+        assert_eq!(expr.value(2), "c");
+    }
+
+    #[test]
+    fn predicate_literal_broadcasts() {
+        let batch = test_batch();
+        let mask = evaluate_predicate(&batch, &Predicate::Literal(true)).unwrap();
+        assert_eq!(mask.len(), batch.num_rows());
+        assert!(mask.iter().all(|v| v == Some(true)));
     }
 
     #[test]

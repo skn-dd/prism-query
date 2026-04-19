@@ -12,6 +12,7 @@ import io.trino.spi.TrinoException;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorSession;
+import io.trino.spi.security.ConnectorIdentity;
 import io.trino.spi.type.*;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.vector.*;
@@ -35,6 +36,7 @@ public class PrismPageSource implements ConnectorPageSource {
     private final List<PrismColumnHandle> columns;
     private final int memoryBudgetGb;
     private final boolean preferSingleWorker;
+    private final ConnectorSession session;
     private final PrismQueryStats queryStats;
 
     private boolean finished;
@@ -55,7 +57,7 @@ public class PrismPageSource implements ConnectorPageSource {
             PrismSplit split,
             PrismTableHandle tableHandle,
             List<PrismColumnHandle> columns) {
-        this(executor, split, tableHandle, columns, 0, false, null);
+        this(executor, split, tableHandle, columns, 0, false, null, null);
     }
 
     public PrismPageSource(
@@ -68,6 +70,7 @@ public class PrismPageSource implements ConnectorPageSource {
         this(executor, split, tableHandle, columns,
                 PrismSessionProperties.getMemoryBudgetGb(session),
                 PrismSessionProperties.isPreferSingleWorker(session),
+                session,
                 queryStats);
     }
 
@@ -78,6 +81,7 @@ public class PrismPageSource implements ConnectorPageSource {
             List<PrismColumnHandle> columns,
             int memoryBudgetGb,
             boolean preferSingleWorker,
+            ConnectorSession session,
             PrismQueryStats queryStats) {
         this.executor = executor;
         this.split = split;
@@ -85,6 +89,7 @@ public class PrismPageSource implements ConnectorPageSource {
         this.columns = columns;
         this.memoryBudgetGb = memoryBudgetGb;
         this.preferSingleWorker = preferSingleWorker;
+        this.session = session;
         this.queryStats = queryStats;
         if (queryStats != null) {
             queryStats.markAccelerationUsed();
@@ -842,6 +847,29 @@ public class PrismPageSource implements ConnectorPageSource {
         if (memoryBudgetGb > 0) {
             command.put("memory_budget_gb", memoryBudgetGb);
         }
+        putSessionContext(command, session);
+    }
+
+    static void putSessionContext(ObjectNode command, ConnectorSession session) {
+        if (session == null) {
+            return;
+        }
+
+        ConnectorIdentity identity = session.getIdentity();
+        ObjectNode sessionContext = command.putObject("session_context");
+        sessionContext.put("user", identity.getUser());
+
+        var groups = sessionContext.putArray("groups");
+        identity.getGroups().stream().sorted().forEach(groups::add);
+
+        var roles = sessionContext.putArray("roles");
+        identity.getEnabledSystemRoles().stream().sorted().forEach(roles::add);
+        identity.getConnectorRole().map(Object::toString).ifPresent(roles::add);
+
+        ObjectNode extraCredentials = sessionContext.putObject("extra_credentials");
+        identity.getExtraCredentials().entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> extraCredentials.put(entry.getKey(), entry.getValue()));
     }
 
     private void addJoinTables(PrismPlanNode node, ObjectNode tablesNode) {

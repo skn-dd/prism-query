@@ -211,7 +211,11 @@ async fn read_parquet_file(
     if let Some(ref proj_cols) = projection {
         let parquet_schema = builder.parquet_schema();
         let num_cols = parquet_schema.num_columns();
-        let valid_cols: Vec<usize> = proj_cols.iter().copied().filter(|&c| c < num_cols).collect();
+        let valid_cols: Vec<usize> = proj_cols
+            .iter()
+            .copied()
+            .filter(|&c| c < num_cols)
+            .collect();
         if !valid_cols.is_empty() {
             let mask = ProjectionMask::roots(parquet_schema, valid_cols.into_iter());
             builder = builder.with_projection(mask);
@@ -240,9 +244,8 @@ async fn read_parquet_file(
         // columns must be handled at the Iceberg/Delta metadata layer (which
         // is where column IDs live). For full scans, adapt here.
         let out = if let (Some(ref ts), None) = (&target_schema, &projection) {
-            adapt_batch_to_schema(&batch, ts).map_err(|e| {
-                format!("adapt batch for {}: {}", file_path, e)
-            })?
+            adapt_batch_to_schema(&batch, ts)
+                .map_err(|e| format!("adapt batch for {}: {}", file_path, e))?
         } else {
             batch
         };
@@ -354,6 +357,7 @@ pub fn row_group_might_match(
     schema: &Schema,
 ) -> bool {
     match predicate {
+        Predicate::Literal(value) => *value,
         Predicate::Eq(col, val) => col_stats_might_match(*col, CmpOp::Eq, val, rg_meta, schema),
         Predicate::Ne(_col, _val) => true,
         Predicate::Lt(col, val) => col_stats_might_match(*col, CmpOp::Lt, val, rg_meta, schema),
@@ -601,17 +605,12 @@ mod tests {
     }
 
     /// Write a parquet file with an arbitrary batch to the given in-memory store.
-    async fn put_parquet_batch(
-        store: &Arc<dyn ObjectStore>,
-        path: &str,
-        batch: &RecordBatch,
-    ) {
+    async fn put_parquet_batch(store: &Arc<dyn ObjectStore>, path: &str, batch: &RecordBatch) {
         let mut buf: Vec<u8> = Vec::new();
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .build();
-        let mut writer =
-            ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
         writer.write(batch).unwrap();
         writer.close().unwrap();
         store
@@ -699,10 +698,9 @@ mod tests {
 
         // With predicate that skips some row groups
         let pred = Predicate::Lt(1, ScalarValue::Float64(150.0));
-        let count =
-            parquet_row_count(vec![dir.to_string_lossy().into_owned()], Some(&pred))
-                .await
-                .unwrap();
+        let count = parquet_row_count(vec![dir.to_string_lossy().into_owned()], Some(&pred))
+            .await
+            .unwrap();
         assert_eq!(count, 200);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -716,10 +714,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let prefix = ObjectPath::from("tables/sample");
         let file = ObjectPath::from("tables/sample/data.parquet");
-        store
-            .put(&file, PutPayload::from(bytes))
-            .await
-            .unwrap();
+        store.put(&file, PutPayload::from(bytes)).await.unwrap();
 
         // Verify list_files sees the upload.
         let listed = list_files(&*store, &prefix, "parquet").await.unwrap();
@@ -730,20 +725,18 @@ mod tests {
         assert_eq!(meta.metadata().num_row_groups(), 5);
 
         let predicate = Predicate::Lt(1, ScalarValue::Float64(150.0));
-        let (batches, skipped, total) = read_parquet_file(
-            store,
-            file,
-            Some(predicate),
-            None,
-            8192,
-            None,
-        )
-        .await
-        .unwrap();
+        let (batches, skipped, total) =
+            read_parquet_file(store, file, Some(predicate), None, 8192, None)
+                .await
+                .unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 200);
         assert_eq!(total, 5);
-        assert!(skipped >= 3, "expected >=3 skipped row groups, got {}", skipped);
+        assert!(
+            skipped >= 3,
+            "expected >=3 skipped row groups, got {}",
+            skipped
+        );
     }
 
     #[tokio::test]
@@ -764,9 +757,7 @@ mod tests {
 
     #[test]
     fn test_adapt_missing_column_injects_nulls() {
-        let src_schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, false),
-        ]));
+        let src_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let src = RecordBatch::try_new(
             src_schema,
             vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
@@ -787,17 +778,14 @@ mod tests {
 
     #[test]
     fn test_adapt_type_promotion_i32_to_i64() {
-        let src_schema = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Int32, false),
-        ]));
+        let src_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let src = RecordBatch::try_new(
             src_schema,
             vec![Arc::new(Int32Array::from(vec![1i32, 2, 3]))],
         )
         .unwrap();
-        let target: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Int64, false),
-        ]));
+        let target: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         let out = adapt_batch_to_schema(&src, &target).unwrap();
         assert_eq!(out.schema(), target);
         let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -806,15 +794,10 @@ mod tests {
 
     #[test]
     fn test_adapt_type_promotion_date32_to_timestamp() {
-        let src_schema = Arc::new(Schema::new(vec![
-            Field::new("d", DataType::Date32, false),
-        ]));
+        let src_schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
         // 0 = 1970-01-01, 1 = 1970-01-02
-        let src = RecordBatch::try_new(
-            src_schema,
-            vec![Arc::new(Date32Array::from(vec![0, 1]))],
-        )
-        .unwrap();
+        let src = RecordBatch::try_new(src_schema, vec![Arc::new(Date32Array::from(vec![0, 1]))])
+            .unwrap();
         let target: SchemaRef = Arc::new(Schema::new(vec![Field::new(
             "d",
             DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -852,7 +835,11 @@ mod tests {
         ]));
         let out = adapt_batch_to_schema(&src, &target).unwrap();
         assert_eq!(out.schema(), target);
-        let b = out.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let b = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(b.value(0), "x");
         let a = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(a.values(), &[10i64, 20]);
@@ -886,18 +873,15 @@ mod tests {
 
     #[test]
     fn test_adapt_invalid_cast_errors() {
-        let src_schema = Arc::new(Schema::new(vec![
-            Field::new("s", DataType::Utf8, false),
-        ]));
+        let src_schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
         let src = RecordBatch::try_new(
             src_schema,
             vec![Arc::new(StringArray::from(vec!["not-a-number"]))],
         )
         .unwrap();
         // arrow_cast will fail to parse "not-a-number" as Int64 with safe=true.
-        let target: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("s", DataType::Int64, false),
-        ]));
+        let target: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Int64, false)]));
         let result = adapt_batch_to_schema(&src, &target);
         assert!(result.is_err(), "expected invalid cast to fail loudly");
     }
@@ -958,16 +942,10 @@ mod tests {
         ];
         let mut all = Vec::new();
         for f in files {
-            let (batches, _s, _t) = read_parquet_file(
-                store.clone(),
-                f,
-                None,
-                None,
-                8192,
-                Some(target.clone()),
-            )
-            .await
-            .unwrap();
+            let (batches, _s, _t) =
+                read_parquet_file(store.clone(), f, None, None, 8192, Some(target.clone()))
+                    .await
+                    .unwrap();
             all.extend(batches);
         }
 
